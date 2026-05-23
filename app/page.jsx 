@@ -1,0 +1,246 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
+
+// ── T-Bill Calculator Logic ───────────────────────────────────────────────────
+function calcTBill(principal, yieldPct, tenorDays) {
+  if (!principal || !yieldPct || !tenorDays) return null;
+  const p = parseFloat(principal.toString().replace(/,/g, ''));
+  const y = parseFloat(yieldPct) / 100;
+  const t = parseInt(tenorDays);
+  if (isNaN(p) || isNaN(y) || isNaN(t) || p <= 0) return null;
+
+  // T-Bills are discount instruments — you pay less upfront, get face value at maturity
+  const discount = p * y * (t / 365);
+  const purchasePrice = p - discount;
+  const profit = discount;
+  const effectiveYield = (profit / purchasePrice) * (365 / t) * 100;
+
+  return {
+    principal: p,
+    purchasePrice: purchasePrice,
+    maturityValue: p,
+    profit: profit,
+    effectiveYield: effectiveYield,
+    tenorDays: t,
+  };
+}
+
+function fmt(n) {
+  return new Intl.NumberFormat('en-SG', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+}
+
+// ── Home Page ─────────────────────────────────────────────────────────────────
+export default function Home() {
+  const [amount, setAmount] = useState('10000');
+  const [yieldVal, setYieldVal] = useState('3.48');
+  const [tenor, setTenor] = useState('182');
+  const [result, setResult] = useState(null);
+  const [latestYield, setLatestYield] = useState('3.48');
+
+  useEffect(() => {
+    // Fetch latest yield from MAS
+    fetch('/api/mas?type=auctions')
+      .then(r => r.json())
+      .then(data => {
+        if (data.success && data.data.length > 0) {
+          const latest = data.data[0];
+          const y = latest.cutoffYield?.replace('%', '');
+          if (y && parseFloat(y) > 0) {
+            setLatestYield(y);
+            setYieldVal(y);
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const r = calcTBill(amount, yieldVal, tenor);
+    setResult(r);
+  }, [amount, yieldVal, tenor]);
+
+  return (
+    <>
+      {/* Hero */}
+      <section className="hero">
+        <div className="hero-inner">
+          <div>
+            <div className="hero-flag">
+              🇸🇬 Built for Singapore Retail Investors
+            </div>
+            <h1>
+              Your <span>T-Bill</span><br />Made Simple
+            </h1>
+            <p className="hero-sub">
+              Calculate returns, track auction dates, and learn how to buy Singapore Treasury Bills — all in one place. No jargon, no signup required.
+            </p>
+            <div className="hero-ctas">
+              <Link href="/calculator" className="btn-primary">
+                Open Calculator →
+              </Link>
+              <Link href="/guide" className="btn-outline">
+                How to Buy
+              </Link>
+            </div>
+          </div>
+
+          {/* Quick calculator card */}
+          <div className="hero-calc">
+            <h3>Quick Calculator</h3>
+            <div className="calc-field">
+              <label>Investment Amount (SGD)</label>
+              <input
+                type="number"
+                value={amount}
+                onChange={e => setAmount(e.target.value)}
+                placeholder="10000"
+                min="1000"
+                step="1000"
+              />
+            </div>
+            <div className="calc-field">
+              <label>Cut-off Yield (% p.a.) — Latest: {latestYield}%</label>
+              <input
+                type="number"
+                value={yieldVal}
+                onChange={e => setYieldVal(e.target.value)}
+                placeholder="3.48"
+                step="0.01"
+              />
+            </div>
+            <div className="calc-field">
+              <label>Tenor</label>
+              <select value={tenor} onChange={e => setTenor(e.target.value)}>
+                <option value="91">3-month (91 days)</option>
+                <option value="182">6-month (182 days)</option>
+                <option value="364">1-year (364 days)</option>
+              </select>
+            </div>
+            {result && (
+              <div className="calc-result">
+                <div className="calc-result-row">
+                  <span className="calc-result-label">You invest</span>
+                  <span className="calc-result-value">S${fmt(result.purchasePrice)}</span>
+                </div>
+                <div className="calc-result-row">
+                  <span className="calc-result-label">You receive at maturity</span>
+                  <span className="calc-result-value">S${fmt(result.maturityValue)}</span>
+                </div>
+                <div className="calc-result-row">
+                  <span className="calc-result-label">Your profit</span>
+                  <span className="calc-result-value big">S${fmt(result.profit)}</span>
+                </div>
+                <div className="calc-result-row">
+                  <span className="calc-result-label">Effective yield p.a.</span>
+                  <span className="calc-result-value">{result.effectiveYield.toFixed(3)}%</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Why T-Bills section */}
+      <section className="section">
+        <div className="container">
+          <div className="section-label">Why T-Bills</div>
+          <h2 className="section-title">Singapore's Safest Investment</h2>
+          <p className="section-sub" style={{ marginBottom: '40px' }}>
+            Treasury Bills are short-term government securities issued by MAS. They're backed by the Singapore Government — as safe as it gets.
+          </p>
+          <div className="card-grid card-grid-3">
+            {[
+              { icon: '🛡️', title: 'Government Backed', desc: 'Issued by the Monetary Authority of Singapore. Your capital is as safe as Singapore itself.' },
+              { icon: '📅', title: 'Short Tenor', desc: 'Choose 6-month or 1-year. Your money isn\'t locked away for long — perfect for cash management.' },
+              { icon: '💰', title: 'Competitive Yields', desc: 'Recent yields have consistently outperformed bank savings rates and most fixed deposits.' },
+              { icon: '🏦', title: 'CPF & SRS Eligible', desc: 'Apply using CPF OA funds or Supplementary Retirement Scheme funds to maximise tax efficiency.' },
+              { icon: '📱', title: 'Easy to Apply', desc: 'Apply through internet banking or ATM. No brokerage account needed.' },
+              { icon: '🔄', title: 'Liquid Secondary Market', desc: 'T-Bills can be sold before maturity on the secondary market if you need funds early.' },
+            ].map((item, i) => (
+              <div key={i} className="card">
+                <div style={{ fontSize: '28px', marginBottom: '12px' }}>{item.icon}</div>
+                <div style={{ fontFamily: 'Playfair Display, serif', fontSize: '17px', fontWeight: '700', marginBottom: '8px' }}>{item.title}</div>
+                <div style={{ fontSize: '14px', color: 'var(--gray-600)', lineHeight: '1.6' }}>{item.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* Quick stats */}
+      <section style={{ background: 'white', padding: '48px 0', borderTop: '1px solid var(--gray-200)', borderBottom: '1px solid var(--gray-200)' }}>
+        <div className="container">
+          <div className="card-grid card-grid-3">
+            <div className="stat-card">
+              <div className="stat-label">Latest 6-Month Yield</div>
+              <div className="stat-value">{latestYield}%</div>
+              <div className="stat-sub">p.a. cut-off yield</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Minimum Investment</div>
+              <div className="stat-value">S$1,000</div>
+              <div className="stat-sub">in multiples of S$1,000</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Application Methods</div>
+              <div className="stat-value">4 ways</div>
+              <div className="stat-sub">ATM, iBanking, CPF, SRS</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* CTA section */}
+      <section className="section">
+        <div className="container">
+          <div className="card-grid card-grid-2" style={{ gap: '24px' }}>
+            <div className="card" style={{ borderTop: '4px solid var(--red)', textAlign: 'center', padding: '40px' }}>
+              <div style={{ fontSize: '40px', marginBottom: '16px' }}>🧮</div>
+              <h3 style={{ fontSize: '22px', marginBottom: '10px' }}>Full Calculator</h3>
+              <p style={{ fontSize: '14px', color: 'var(--gray-600)', marginBottom: '20px', lineHeight: '1.6' }}>
+                Calculate exact returns, compare different amounts and tenors, and see a full breakdown of your investment.
+              </p>
+              <Link href="/calculator" className="btn-primary" style={{ justifyContent: 'center' }}>
+                Open Calculator
+              </Link>
+            </div>
+            <div className="card" style={{ borderTop: '4px solid var(--gold)', textAlign: 'center', padding: '40px' }}>
+              <div style={{ fontSize: '40px', marginBottom: '16px' }}>📋</div>
+              <h3 style={{ fontSize: '22px', marginBottom: '10px' }}>Upcoming Auctions</h3>
+              <p style={{ fontSize: '14px', color: 'var(--gray-600)', marginBottom: '20px', lineHeight: '1.6' }}>
+                See upcoming auction dates, historical yields, and cut-off prices sourced directly from MAS.
+              </p>
+              <Link href="/auctions" className="btn-primary" style={{ justifyContent: 'center', background: 'var(--gold)', color: 'white' }}>
+                View Auctions
+              </Link>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Donate section */}
+      <section className="section" style={{ paddingTop: 0 }} id="donate">
+        <div className="container">
+          <div className="donate-bar">
+            <div>
+              <div className="donate-text" style={{ fontWeight: '600', marginBottom: '4px' }}>☕ This tool is free and always will be</div>
+              <div className="donate-text">If T-Bill Buddy saved you time or helped you earn more, consider buying me a coffee to keep the servers running.</div>
+            </div>
+            <a href="https://ko-fi.com" target="_blank" rel="noopener" className="btn-donate">
+              Support This Tool
+            </a>
+          </div>
+        </div>
+      </section>
+
+      {/* Disclaimer */}
+      <div className="container" style={{ paddingBottom: '32px' }}>
+        <div className="disclaimer">
+          <strong>Disclaimer:</strong> SG T-Bill Buddy is an independent tool for informational purposes only. It does not constitute financial advice. Always verify information with the official MAS website (mas.gov.sg) before making investment decisions. Past yields do not guarantee future returns.
+        </div>
+      </div>
+    </>
+  );
+}
