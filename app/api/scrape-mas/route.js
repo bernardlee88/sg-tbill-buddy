@@ -205,6 +205,19 @@ export async function GET(request) {
     return Response.json({ error: 'Unauthorised' }, { status: 401 });
   }
 
+  // Debug mode — check env vars first
+  const debug = new URL(request.url).searchParams.get('debug') === '1';
+  if (debug) {
+    return Response.json({
+      env: {
+        BROWSERLESS_API_KEY: process.env.BROWSERLESS_API_KEY ? 'set (' + process.env.BROWSERLESS_API_KEY.slice(0, 8) + '...)' : 'MISSING',
+        SUPABASE_URL: process.env.SUPABASE_URL ? 'set' : 'MISSING',
+        SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING',
+        CRON_SECRET: process.env.CRON_SECRET ? 'set' : 'MISSING',
+      }
+    });
+  }
+
   try {
     const supabase = getSupabaseClient();
     console.log('Starting MAS T-Bill scrape...');
