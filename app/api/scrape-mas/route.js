@@ -1,6 +1,5 @@
 // app/api/scrape-mas/route.js
 // Scrapes MAS T-Bill auction results using Browserless
-// MAS page requires form interaction to load results
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -79,6 +78,47 @@ export async function GET(request) {
     });
   }
 
+  // Inspect mode — see all buttons and inputs on page after form interaction
+  if (params.get('inspect') === '1') {
+    try {
+      const result = await browserlessRequest(`
+        export default async function ({ page }) {
+          await page.goto('https://eservices.mas.gov.sg/statistics/fdanet/BondTreasuryBillsCMTBsAuctions.aspx', {
+            waitUntil: 'networkidle2',
+            timeout: 30000,
+          });
+          await page.waitForSelector('#ContentPlaceHolder1_StartYearDropDownList', { timeout: 10000 });
+
+          // Get all buttons and submit inputs inside the main content area
+          const buttons = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button')).map(b => ({
+              tag: b.tagName,
+              type: b.type,
+              id: b.id,
+              name: b.name,
+              value: b.value,
+              text: b.innerText,
+              className: b.className,
+            }));
+          });
+
+          // Get all radio buttons and their labels
+          const radios = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('input[type="radio"]')).map(r => {
+              const label = document.querySelector('label[for="' + r.id + '"]');
+              return { id: r.id, name: r.name, value: r.value, label: label ? label.innerText : '', checked: r.checked };
+            });
+          });
+
+          return { buttons, radios };
+        }
+      `);
+      return Response.json({ inspect: result });
+    } catch (err) {
+      return Response.json({ error: err.message });
+    }
+  }
+
   try {
     const supabase = getSupabaseClient();
     const currentYear = new Date().getFullYear().toString();
@@ -91,83 +131,91 @@ export async function GET(request) {
           timeout: 30000,
         });
 
-        // Wait for dropdowns to be ready
         await page.waitForSelector('#ContentPlaceHolder1_StartYearDropDownList', { timeout: 10000 });
 
-        // Select T-bills product type radio/checkbox
-        // Try clicking the T-bills option
-        const tbillsClicked = await page.evaluate(() => {
-          // Look for radio buttons or checkboxes for T-bills
-          const inputs = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
-          const tbillInput = inputs.find(i => {
-            const label = document.querySelector('label[for="' + i.id + '"]');
-            return (label && label.innerText.includes('T-bills')) || i.value.includes('T-bill') || i.id.includes('Tbill') || i.id.includes('TBill');
+        // Click T-bills radio button
+        await page.evaluate(() => {
+          const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+          const tbill = radios.find(r => {
+            const label = document.querySelector('label[for="' + r.id + '"]');
+            const labelText = label ? label.innerText.trim() : '';
+            return labelText === 'T-bills' || r.value === 'T-bills' || r.value === 'TBills';
           });
-          if (tbillInput) { tbillInput.click(); return true; }
-          return false;
+          if (tbill) tbill.click();
         });
 
-        console.log('T-bills radio clicked:', tbillsClicked);
+        await new Promise(r => setTimeout(r, 500));
 
-        // Set start year to ${startYear}
+        // Set date range
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
-
-        // Set end year to ${currentYear}
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${currentYear}');
-
-        // Set start month to Jan
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', 'Jan');
-
-        // Set end month to Dec
         await page.select('#ContentPlaceHolder1_EndMonthDropDownList', 'Dec');
 
-        // Set T-bills term to "All"
-        await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All');
+        // Set T-bills tenor to All
+        try {
+          await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All');
+        } catch(e) {}
 
-        // Find and click the search/show button
-        const buttonClicked = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], input[type="button"], button'));
-          const searchBtn = buttons.find(b => {
-            const text = (b.value || b.innerText || '').toLowerCase();
-            return text.includes('show') || text.includes('search') || text.includes('go') || text.includes('submit');
-          });
-          if (searchBtn) { searchBtn.click(); return searchBtn.value || searchBtn.innerText; }
-          return null;
+        // Click the Show Results button — look for input[type=submit] inside the form
+        // NOT the navigation buttons
+        const submitClicked = await page.evaluate(() => {
+          // Find submit button inside ContentPlaceHolder (main content area)
+          const mainContent = document.querySelector('#ContentPlaceHolder1') ||
+                              document.querySelector('[id*="ContentPlaceHolder"]') ||
+                              document.querySelector('form');
+
+          if (mainContent) {
+            const submitBtn = mainContent.querySelector('input[type="submit"], input[type="button"][value*="Show"], input[type="button"][id*="Show"], input[type="button"][id*="search"]');
+            if (submitBtn) {
+              submitBtn.click();
+              return { clicked: true, id: submitBtn.id, value: submitBtn.value };
+            }
+
+            // Try any input[type=submit] inside form
+            const allSubmits = Array.from(mainContent.querySelectorAll('input[type="submit"], input[type="button"]'));
+            if (allSubmits.length > 0) {
+              allSubmits[0].click();
+              return { clicked: true, id: allSubmits[0].id, value: allSubmits[0].value };
+            }
+          }
+
+          // Last resort — find by ID pattern
+          const showBtn = document.querySelector('[id*="Show"], [id*="Submit"], [id*="Search"], [id*="Go"]');
+          if (showBtn) {
+            showBtn.click();
+            return { clicked: true, id: showBtn.id, value: showBtn.value || showBtn.innerText };
+          }
+
+          return { clicked: false };
         });
 
-        console.log('Search button clicked:', buttonClicked);
-
         // Wait for results to load
-        await new Promise(r => setTimeout(r, 4000));
+        await new Promise(r => setTimeout(r, 5000));
 
         // Extract table data
         const tableData = await page.evaluate(() => {
           const results = [];
           const tables = document.querySelectorAll('table');
-
           tables.forEach((table, tIdx) => {
             const rows = Array.from(table.querySelectorAll('tr'));
             rows.forEach((row, rIdx) => {
               const cells = Array.from(row.querySelectorAll('th, td')).map(c => c.innerText.trim());
-              if (cells.length > 0) {
-                results.push({ tableIdx: tIdx, rowIdx: rIdx, cells });
-              }
+              if (cells.length > 0) results.push({ tableIdx: tIdx, rowIdx: rIdx, cells });
             });
           });
-
           return results;
         });
 
-        // Also get page text for debugging
-        const pageText = await page.evaluate(() => document.body.innerText.slice(0, 2000));
+        const pageText = await page.evaluate(() => document.body.innerText.slice(0, 3000));
 
-        return { tableData, pageText, tbillsClicked, buttonClicked };
+        return { tableData, pageText, submitClicked };
       }
     `);
 
     const rows = result?.tableData || [];
     const pageText = result?.pageText || '';
-    console.log('Got', rows.length, 'rows, tbillsClicked:', result?.tbillsClicked, 'buttonClicked:', result?.buttonClicked);
+    console.log('Got', rows.length, 'rows, submitClicked:', JSON.stringify(result?.submitClicked));
 
     // Parse rows into auction records
     const auctions = [];
@@ -175,30 +223,30 @@ export async function GET(request) {
       const cells = row.cells || [];
       if (cells.length < 3) continue;
 
-      // Skip header rows
-      const allText = cells.join(' ').toLowerCase();
-      if (allText.includes('issue date') || allText.includes('maturity date') || allText.includes('auction date')) continue;
+      const allText = cells.join(' ');
 
-      // Look for date pattern
+      // Skip header rows
+      if (/issue date|maturity date|cut.off|tenor/i.test(allText) && !/\d{4}/.test(cells[0])) continue;
+
       const dateMatch = cells.find(c =>
         /\d{1,2}\s+\w{3}\s+\d{4}/.test(c) ||
         /\d{2}\/\d{2}\/\d{4}/.test(c) ||
         /\d{4}-\d{2}-\d{2}/.test(c)
       );
 
-      // Look for yield (small decimal number between 0 and 15)
-      const yieldMatch = cells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
+      const yieldMatch = cells.find(c =>
+        /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0
+      );
 
-      // Look for price (high 90s number)
       const priceMatch = cells.find(c => /^9[5-9]\.\d+$/.test(c));
 
-      // Look for maturity date (second date in row)
-      const dates = cells.filter(c => /\d{1,2}\s+\w{3}\s+\d{4}|\d{2}\/\d{2}\/\d{4}/.test(c));
+      const dates = cells.filter(c =>
+        /\d{1,2}\s+\w{3}\s+\d{4}|\d{2}\/\d{2}\/\d{4}/.test(c)
+      );
       const maturityDate = dates.length > 1 ? dates[1] : null;
 
       if (!dateMatch || !yieldMatch) continue;
 
-      // Determine tenor
       const tenor = /1.year|1-year|364|12.month|1 year/i.test(allText) ? '1-year' : '6-month';
 
       auctions.push({
@@ -215,12 +263,11 @@ export async function GET(request) {
     if (auctions.length === 0) {
       return Response.json({
         success: false,
-        message: 'Page loaded but no auction data found. Check sample rows.',
+        message: 'Could not parse auction data.',
         rowCount: rows.length,
         sampleRows: rows.slice(0, 10),
-        pageTextPreview: pageText.slice(0, 500),
-        tbillsClicked: result?.tbillsClicked,
-        buttonClicked: result?.buttonClicked,
+        pageTextPreview: pageText.slice(500, 2000),
+        submitClicked: result?.submitClicked,
       });
     }
 
