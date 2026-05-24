@@ -1,90 +1,83 @@
 // app/api/mas/route.js
-// Fetches Singapore T-Bill auction data
-// Primary: data.gov.sg API (official Singapore government open data)
-// Fallback: hardcoded recent data (verified from MAS website May 2026)
+// Serves T-Bill auction data
+// Primary: reads from Supabase tbill_auctions table (populated by /api/scrape-mas)
+// Fallback: hardcoded recent data if Supabase is empty
 
-export const revalidate = 3600; // Cache for 1 hour
+import { createClient } from '@supabase/supabase-js';
 
-// Verified from MAS Treasury Bills Statistics — May 2026
-// Current yield environment: ~1.39-1.47% p.a.
+export const revalidate = 3600;
+
+function getSupabaseClient() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key);
+}
+
+// Verified from MAS — May 2026
+// Only used if Supabase has no data yet
 const FALLBACK_DATA = [
-  { auctionDate: '22 May 2026', tenor: '6-month', cutoffYield: '1.42%', cutoffPrice: '99.297', maturityDate: '19 Nov 2026' },
-  { auctionDate: '8 May 2026', tenor: '6-month', cutoffYield: '1.44%', cutoffPrice: '99.287', maturityDate: '5 Nov 2026' },
-  { auctionDate: '24 Apr 2026', tenor: '1-year', cutoffYield: '1.46%', cutoffPrice: '98.549', maturityDate: '23 Apr 2027' },
-  { auctionDate: '10 Apr 2026', tenor: '6-month', cutoffYield: '1.47%', cutoffPrice: '99.281', maturityDate: '9 Oct 2026' },
-  { auctionDate: '9 Apr 2026', tenor: '6-month', cutoffYield: '1.47%', cutoffPrice: '99.281', maturityDate: '8 Oct 2026' },
-  { auctionDate: '26 Mar 2026', tenor: '6-month', cutoffYield: '1.43%', cutoffPrice: '99.287', maturityDate: '25 Sep 2026' },
-  { auctionDate: '12 Mar 2026', tenor: '1-year', cutoffYield: '1.39%', cutoffPrice: '98.619', maturityDate: '11 Mar 2027' },
-  { auctionDate: '26 Feb 2026', tenor: '6-month', cutoffYield: '1.38%', cutoffPrice: '99.311', maturityDate: '27 Aug 2026' },
-  { auctionDate: '12 Feb 2026', tenor: '6-month', cutoffYield: '1.40%', cutoffPrice: '99.301', maturityDate: '13 Aug 2026' },
-  { auctionDate: '29 Jan 2026', tenor: '1-year', cutoffYield: '1.41%', cutoffPrice: '98.601', maturityDate: '28 Jan 2027' },
+  { auction_date: '21 May 2026', tenor: '6-month', cutoff_yield: '1.45%', cutoff_price: '99.283', maturity_date: '19 Nov 2026' },
+  { auction_date: '8 May 2026', tenor: '6-month', cutoff_yield: '1.44%', cutoff_price: '99.287', maturity_date: '5 Nov 2026' },
+  { auction_date: '24 Apr 2026', tenor: '1-year', cutoff_yield: '1.46%', cutoff_price: '98.549', maturity_date: '23 Apr 2027' },
+  { auction_date: '9 Apr 2026', tenor: '6-month', cutoff_yield: '1.47%', cutoff_price: '99.281', maturity_date: '8 Oct 2026' },
+  { auction_date: '26 Mar 2026', tenor: '6-month', cutoff_yield: '1.43%', cutoff_price: '99.287', maturity_date: '25 Sep 2026' },
+  { auction_date: '12 Mar 2026', tenor: '1-year', cutoff_yield: '1.39%', cutoff_price: '98.619', maturity_date: '11 Mar 2027' },
+  { auction_date: '26 Feb 2026', tenor: '6-month', cutoff_yield: '1.38%', cutoff_price: '99.311', maturity_date: '27 Aug 2026' },
+  { auction_date: '12 Feb 2026', tenor: '6-month', cutoff_yield: '1.40%', cutoff_price: '99.301', maturity_date: '13 Aug 2026' },
+  { auction_date: '29 Jan 2026', tenor: '1-year', cutoff_yield: '1.41%', cutoff_price: '98.601', maturity_date: '28 Jan 2027' },
+  { auction_date: '15 Jan 2026', tenor: '6-month', cutoff_yield: '1.40%', cutoff_price: '99.301', maturity_date: '16 Jul 2026' },
 ];
 
-async function fetchFromDataGovSg() {
-  // data.gov.sg SGS Auction Results dataset
-  const res = await fetch(
-    'https://data.gov.sg/api/action/datastore_search?resource_id=9a0bf149-308c-4bd2-832d-76c8e6cb47ed&limit=20&sort=auction_date+desc',
-    {
-      headers: { 'User-Agent': 'SGTBillBuddy/1.0' },
-      next: { revalidate: 3600 },
-    }
-  );
-  if (!res.ok) throw new Error('data.gov.sg API error: ' + res.status);
-  const data = await res.json();
-  return data?.result?.records || [];
-}
-
-async function fetchFromMasEServices() {
-  // MAS eServices alternative endpoint
-  const res = await fetch(
-    'https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=9a0bf149-308c-4bd2-832d-76c8e6cb47ed&limit=20&sort=auction_date%20desc',
-    {
-      headers: { 'User-Agent': 'SGTBillBuddy/1.0' },
-      next: { revalidate: 3600 },
-    }
-  );
-  if (!res.ok) throw new Error('MAS API error: ' + res.status);
-  const data = await res.json();
-  return data?.result?.records || [];
-}
-
-function normaliseRecord(r) {
+function normalise(r) {
   return {
-    auctionDate: r.auction_date || r.issue_date || '',
-    maturityDate: r.maturity_date || '',
-    tenor: r.tenor || r.maturity || '6-month',
-    cutoffYield: r.cutoff_yield ? r.cutoff_yield + '%' : '',
+    auctionDate: r.auction_date,
+    tenor: r.tenor,
+    cutoffYield: r.cutoff_yield,
     cutoffPrice: r.cutoff_price || '',
-    isin: r.isin || r.security_code || '',
+    maturityDate: r.maturity_date || '',
   };
-}
-
-function isTBill(r) {
-  const type = (r.product_type || r.bill_type || r.product || r.bond_type || r.security_type || '').toLowerCase();
-  return type.includes('t-bill') || type.includes('tbill') || type.includes('treasury bill');
 }
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const type = searchParams.get('type') || 'auctions';
 
-  // Try fetching live data from two sources
-  let liveData = [];
+  let data = [];
+  let source = 'fallback';
 
+  // Try Supabase first
   try {
-    const records = await fetchFromDataGovSg();
-    liveData = records.filter(isTBill).slice(0, 15).map(normaliseRecord);
-  } catch {
-    try {
-      const records = await fetchFromMasEServices();
-      liveData = records.filter(isTBill).slice(0, 15).map(normaliseRecord);
-    } catch {
-      // Both failed — use fallback
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      const { data: rows, error } = await supabase
+        .from('tbill_auctions')
+        .select('*')
+        .order('auction_date', { ascending: false })
+        .limit(20);
+
+      if (!error && rows && rows.length > 0) {
+        data = rows.map(normalise);
+        source = 'supabase';
+        console.log('Serving', data.length, 'auctions from Supabase');
+      }
     }
+  } catch (err) {
+    console.error('Supabase read error:', err.message);
   }
 
-  const data = liveData.length > 0 ? liveData : FALLBACK_DATA;
-  const isLive = liveData.length > 0;
+  // Fall back to hardcoded data
+  if (data.length === 0) {
+    data = FALLBACK_DATA.map(r => ({
+      auctionDate: r.auction_date,
+      tenor: r.tenor,
+      cutoffYield: r.cutoff_yield,
+      cutoffPrice: r.cutoff_price,
+      maturityDate: r.maturity_date,
+    }));
+    source = 'fallback';
+    console.log('Serving fallback auction data');
+  }
 
   if (type === 'yields') {
     const yields = data.map(d => ({
@@ -92,14 +85,18 @@ export async function GET(request) {
       tenor: d.tenor,
       yield: parseFloat((d.cutoffYield || '0').replace('%', '')),
     })).filter(d => d.yield > 0);
-    return Response.json({ success: true, data: yields, live: isLive });
+    return Response.json({ success: true, data: yields, source });
   }
+
+  // Get latest yield for home page stat
+  const latest6m = data.find(d => d.tenor === '6-month');
+  const latestYield = latest6m?.cutoffYield?.replace('%', '') || '1.45';
 
   return Response.json({
     success: true,
     data,
-    live: isLive,
-    lastUpdated: isLive ? 'Live' : 'May 2026',
-    source: isLive ? 'data.gov.sg' : 'MAS Treasury Bills Statistics',
+    latestYield,
+    source,
+    lastUpdated: source === 'supabase' ? 'Live from MAS' : 'May 2026',
   });
 }

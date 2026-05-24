@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "app/api/scrape-mas/route.js": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/scrape-mas",
+      "schedule": "0 10 * * 4"
+    }
+  ]
+}
