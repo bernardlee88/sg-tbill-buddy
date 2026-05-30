@@ -1,6 +1,5 @@
 // app/api/scrape-mas/route.js
 // Scrapes MAS T-Bill auction results using Browserless
-// ASP.NET WebForms page — uses proper form submission with waitForNavigation
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -93,7 +92,7 @@ export async function GET(request) {
 
         await page.waitForSelector('#ContentPlaceHolder1_StartYearDropDownList', { timeout: 10000 });
 
-        // Step 1 — Uncheck all product checkboxes
+        // Uncheck all product checkboxes
         const allProductIds = [
           'ContentPlaceHolder1_SGSBondsCheckBox',
           'ContentPlaceHolder1_SGSBondsMasCheckBoxList_0',
@@ -108,55 +107,66 @@ export async function GET(request) {
           if (el) {
             const checked = await page.evaluate(e => e.checked, el);
             if (checked) await el.click();
+            await new Promise(r => setTimeout(r, 100));
           }
         }
 
-        await new Promise(r => setTimeout(r, 500));
-
-        // Step 2 — Check T-bills only
+        // Check T-bills only
         await page.click('#ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
         await new Promise(r => setTimeout(r, 500));
 
-        // Step 3 — Set date range
+        // Set date range
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${currentYear}');
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', 'Jan');
         await page.select('#ContentPlaceHolder1_EndMonthDropDownList', 'Dec');
 
-        // Step 4 — Set tenor to All
-        try {
-          await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All');
-        } catch(e) {}
+        // Tenor to All
+        try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
-        // Step 5 — Select columns: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
+        // Uncheck all column checkboxes
         for (let i = 0; i <= 16; i++) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
           if (el) {
             const checked = await page.evaluate(e => e.checked, el);
             if (checked) await el.click();
+            await new Promise(r => setTimeout(r, 50));
           }
         }
-        await new Promise(r => setTimeout(r, 300));
 
+        // Check only: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
         for (const i of [3, 6, 7, 11, 12]) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
           if (el) await el.click();
+          await new Promise(r => setTimeout(r, 100));
         }
-        await new Promise(r => setTimeout(r, 300));
 
-        // Step 6 — Click Display and wait for page reload (ASP.NET postback)
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }),
-          page.click('#ContentPlaceHolder1_DisplayButton'),
-        ]);
+        // Take screenshot before clicking to verify state
+        const beforeState = await page.evaluate(() => {
+          const tbill = document.getElementById('ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
+          const col11 = document.getElementById('ContentPlaceHolder1_SelectedColumnsCheckBoxList_11');
+          return {
+            tbillChecked: tbill ? tbill.checked : null,
+            yieldColChecked: col11 ? col11.checked : null,
+          };
+        });
+        console.log('Before click state:', JSON.stringify(beforeState));
 
-        // Step 7 — Extract table
+        // Click Display — ASP.NET UpdatePanel uses partial postback
+        // Use evaluate to directly submit form
+        await page.evaluate(() => {
+          const btn = document.getElementById('ContentPlaceHolder1_DisplayButton');
+          if (btn) btn.click();
+        });
+
+        // Wait for UpdatePanel to complete (AJAX partial postback)
+        await new Promise(r => setTimeout(r, 8000));
+
+        // Extract all text and tables
         const tableData = await page.evaluate(() => {
           const results = [];
-          const tables = document.querySelectorAll('table');
-          tables.forEach((table, tIdx) => {
-            const rows = Array.from(table.querySelectorAll('tr'));
-            rows.forEach((row, rIdx) => {
+          document.querySelectorAll('table').forEach((table, tIdx) => {
+            table.querySelectorAll('tr').forEach((row, rIdx) => {
               const cells = Array.from(row.querySelectorAll('th, td')).map(c => c.innerText.trim());
               if (cells.length > 0) results.push({ tableIdx: tIdx, rowIdx: rIdx, cells });
             });
@@ -164,16 +174,18 @@ export async function GET(request) {
           return results;
         });
 
-        const pageText = await page.evaluate(() => document.body.innerText.slice(800, 3000));
+        // Also get full page text to see what loaded
+        const pageText = await page.evaluate(() => document.body.innerText);
 
-        return { tableData, pageText };
+        return { tableData, pageText: pageText.slice(800, 3000), beforeState };
       }
     `);
 
     const rows = result?.tableData || [];
-    console.log('Got', rows.length, 'rows from MAS');
+    const pageText = result?.pageText || '';
+    console.log('Rows:', rows.length, 'beforeState:', JSON.stringify(result?.beforeState));
 
-    // Parse rows — detect header then extract data
+    // Parse rows
     const auctions = [];
     let headerFound = false;
     let colMap = {};
@@ -182,7 +194,6 @@ export async function GET(request) {
       const cells = row.cells || [];
       if (cells.length < 2) continue;
 
-      // Detect header row
       if (!headerFound && cells.some(c => /cut.off yield|issue date/i.test(c))) {
         headerFound = true;
         cells.forEach((c, i) => {
@@ -202,7 +213,7 @@ export async function GET(request) {
       const maturityDate = colMap.maturityDate !== undefined ? cells[colMap.maturityDate] : null;
       const yieldVal = colMap.yield !== undefined ? cells[colMap.yield] : cells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
       const price = colMap.price !== undefined ? cells[colMap.price] : cells.find(c => /^9[5-9]\.\d+$/.test(c));
-      const tenorCell = colMap.tenor !== undefined ? cells[colMap.tenor] : '';
+      const tenorCell = colMap.tenor !== undefined ? (cells[colMap.tenor] || '') : '';
 
       if (!issueDate || !yieldVal) continue;
 
@@ -217,16 +228,15 @@ export async function GET(request) {
       });
     }
 
-    console.log('Parsed', auctions.length, 'auction records');
-
     if (auctions.length === 0) {
       return Response.json({
         success: false,
         message: 'Could not parse auction data.',
         rowCount: rows.length,
         sampleRows: rows.slice(0, 20),
-        pageTextPreview: result?.pageText?.slice(0, 1000),
+        pageTextPreview: pageText,
         colMap,
+        beforeState: result?.beforeState,
       });
     }
 
