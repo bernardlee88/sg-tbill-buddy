@@ -189,6 +189,8 @@ export async function GET(request) {
     console.log('Rows:', rows.length, 'AJAX responses:', ajaxResponses.length);
 
     // Parse rows
+    // Data format from MAS: [Term(days), Unit, IssueDate(DD/MM/YYYY), MaturityDate, Yield, Price]
+    // Header row has newlines e.g. "Cut-off\nYield (%)"
     const auctions = [];
     let headerFound = false;
     let colMap = {};
@@ -197,37 +199,62 @@ export async function GET(request) {
       const cells = row.cells || [];
       if (cells.length < 2) continue;
 
-      if (!headerFound && cells.some(c => /cut.off yield|issue date/i.test(c))) {
+      // Normalise cells — remove newlines for header matching
+      const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
+
+      // Detect header row
+      if (!headerFound && normCells.some(c => /cut.off yield|issue.?date/i.test(c))) {
         headerFound = true;
-        cells.forEach((c, i) => {
+        normCells.forEach((c, i) => {
           const norm = c.toLowerCase();
-          if (/issue date/.test(norm)) colMap.issueDate = i;
-          if (/maturity date/.test(norm)) colMap.maturityDate = i;
+          if (/issue.?date/.test(norm)) colMap.issueDate = i;
+          if (/maturity.?date/.test(norm)) colMap.maturityDate = i;
           if (/cut.off yield/.test(norm)) colMap.yield = i;
           if (/cut.off price/.test(norm)) colMap.price = i;
-          if (/term|tenor/.test(norm)) colMap.tenor = i;
+          if (/term|tenor/.test(norm)) colMap.term = i;
         });
+        console.log('colMap:', JSON.stringify(colMap));
         continue;
       }
 
       if (!headerFound) continue;
 
-      const issueDate = colMap.issueDate !== undefined ? cells[colMap.issueDate] : cells.find(c => /\d{1,2}\s+\w{3}\s+\d{4}/.test(c));
-      const maturityDate = colMap.maturityDate !== undefined ? cells[colMap.maturityDate] : null;
-      const yieldVal = colMap.yield !== undefined ? cells[colMap.yield] : cells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
-      const price = colMap.price !== undefined ? cells[colMap.price] : cells.find(c => /^9[5-9]\.\d+$/.test(c));
-      const tenorCell = colMap.tenor !== undefined ? (cells[colMap.tenor] || '') : '';
+      // Skip rows that are clearly not data
+      if (normCells[0] === 'Bond Auction Results') continue;
+
+      // Extract fields using column map
+      // From sample: ["182","Day","07/01/2025","08/07/2025","3.05","98.479"]
+      // colMap based on header: term=0, issueDate=2, maturityDate=3, yield=4, price=5
+      const issueDate = colMap.issueDate !== undefined ? normCells[colMap.issueDate] : normCells.find(c => /\d{2}\/\d{2}\/\d{4}/.test(c));
+      const maturityDate = colMap.maturityDate !== undefined ? normCells[colMap.maturityDate] : null;
+      const yieldVal = colMap.yield !== undefined ? normCells[colMap.yield] : normCells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
+      const price = colMap.price !== undefined ? normCells[colMap.price] : normCells.find(c => /^9[5-9]\.\d+$/.test(c));
+      const termDays = colMap.term !== undefined ? normCells[colMap.term] : normCells[0];
 
       if (!issueDate || !yieldVal) continue;
+      if (!/\d{2}\/\d{2}\/\d{4}/.test(issueDate)) continue;
 
-      const tenor = /1.year|1-year|364|1 year/i.test(tenorCell + cells.join(' ')) ? '1-year' : '6-month';
+      // Convert DD/MM/YYYY to readable format
+      const [day, month, year] = issueDate.split('/');
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const formattedDate = day + ' ' + months[parseInt(month) - 1] + ' ' + year;
+
+      let formattedMaturity = null;
+      if (maturityDate && /\d{2}\/\d{2}\/\d{4}/.test(maturityDate)) {
+        const [md, mm, my] = maturityDate.split('/');
+        formattedMaturity = md + ' ' + months[parseInt(mm) - 1] + ' ' + my;
+      }
+
+      // Determine tenor from term days
+      const days = parseInt(termDays) || 0;
+      const tenor = days >= 350 ? '1-year' : '6-month';
 
       auctions.push({
-        auction_date: issueDate.trim(),
+        auction_date: formattedDate,
         tenor,
         cutoff_yield: parseFloat(yieldVal).toFixed(2) + '%',
         cutoff_price: price || null,
-        maturity_date: maturityDate ? maturityDate.trim() : null,
+        maturity_date: formattedMaturity,
       });
     }
 
