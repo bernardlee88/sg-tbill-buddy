@@ -46,6 +46,16 @@ export async function GET(request) {
   let data = [];
   let source = 'fallback';
 
+  function parseDateToSortKey(dateStr) {
+    // Parse "07 Jan 2025" or "DD/MM/YYYY" into a sortable number
+    const months = { Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12 };
+    const m1 = dateStr.match(/(\d{1,2})\s+(\w{3})\s+(\d{4})/);
+    if (m1) return parseInt(m1[3]) * 10000 + (months[m1[2]] || 0) * 100 + parseInt(m1[1]);
+    const m2 = dateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    if (m2) return parseInt(m2[3]) * 10000 + parseInt(m2[2]) * 100 + parseInt(m2[1]);
+    return 0;
+  }
+
   // Try Supabase first
   try {
     const supabase = getSupabaseClient();
@@ -53,11 +63,11 @@ export async function GET(request) {
       const { data: rows, error } = await supabase
         .from('tbill_auctions')
         .select('*')
-        .order('auction_date', { ascending: false })
-        .limit(20);
+        .order('scraped_at', { ascending: false }) // sorted in JS by parsed date
+        .limit(30);
 
       if (!error && rows && rows.length > 0) {
-        data = rows.map(normalise);
+        data = rows.map(normalise).sort((a, b) => parseDateToSortKey(b.auctionDate) - parseDateToSortKey(a.auctionDate));
         source = 'supabase';
         console.log('Serving', data.length, 'auctions from Supabase');
       }
