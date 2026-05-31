@@ -1,6 +1,4 @@
 // app/api/scrape-mas/route.js
-// Scrapes MAS T-Bill auction results using Browserless
-
 import { createClient } from '@supabase/supabase-js';
 
 function getSupabaseClient() {
@@ -20,7 +18,6 @@ function isAuthorised(request) {
 async function browserlessRequest(code) {
   const apiKey = process.env.BROWSERLESS_API_KEY;
   if (!apiKey) throw new Error('Missing BROWSERLESS_API_KEY');
-
   const res = await fetch(
     'https://chrome.browserless.io/function?token=' + apiKey,
     {
@@ -29,12 +26,10 @@ async function browserlessRequest(code) {
       body: JSON.stringify({ code }),
     }
   );
-
   if (!res.ok) {
     const errText = await res.text();
     throw new Error('Browserless error: ' + res.status + ' — ' + errText.slice(0, 200));
   }
-
   return res.json();
 }
 
@@ -85,6 +80,21 @@ export async function GET(request) {
 
     const result = await browserlessRequest(`
       export default async function ({ page }) {
+        // Intercept XHR/fetch to capture UpdatePanel response
+        const ajaxResponses = [];
+        await page.setRequestInterception(true);
+        page.on('request', req => req.continue());
+        page.on('response', async res => {
+          const url = res.url();
+          const ct = res.headers()['content-type'] || '';
+          if (url.includes('fdanet') || ct.includes('text/plain') || ct.includes('text/html')) {
+            try {
+              const text = await res.text();
+              if (text.length > 100) ajaxResponses.push({ url, length: text.length, preview: text.slice(0, 200) });
+            } catch(e) {}
+          }
+        });
+
         await page.goto('https://eservices.mas.gov.sg/statistics/fdanet/BondTreasuryBillsCMTBsAuctions.aspx', {
           waitUntil: 'networkidle2',
           timeout: 30000,
@@ -93,7 +103,7 @@ export async function GET(request) {
         await page.waitForSelector('#ContentPlaceHolder1_StartYearDropDownList', { timeout: 10000 });
 
         // Uncheck all product checkboxes
-        const allProductIds = [
+        for (const id of [
           'ContentPlaceHolder1_SGSBondsCheckBox',
           'ContentPlaceHolder1_SGSBondsMasCheckBoxList_0',
           'ContentPlaceHolder1_SGSBondsMasCheckBoxList_1',
@@ -101,8 +111,7 @@ export async function GET(request) {
           'ContentPlaceHolder1_TBillsAndCMTBsCheckBox',
           'ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0',
           'ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_1',
-        ];
-        for (const id of allProductIds) {
+        ]) {
           const el = await page.$('#' + id);
           if (el) {
             const checked = await page.evaluate(e => e.checked, el);
@@ -113,18 +122,16 @@ export async function GET(request) {
 
         // Check T-bills only
         await page.click('#ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 300));
 
         // Set date range
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${currentYear}');
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', 'Jan');
         await page.select('#ContentPlaceHolder1_EndMonthDropDownList', 'Dec');
-
-        // Tenor to All
         try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
-        // Uncheck all column checkboxes
+        // Uncheck all column checkboxes then check needed ones
         for (let i = 0; i <= 16; i++) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
           if (el) {
@@ -133,36 +140,32 @@ export async function GET(request) {
             await new Promise(r => setTimeout(r, 50));
           }
         }
-
-        // Check only: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
         for (const i of [3, 6, 7, 11, 12]) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
-          if (el) await el.click();
-          await new Promise(r => setTimeout(r, 100));
+          if (el) { await el.click(); await new Promise(r => setTimeout(r, 100)); }
         }
 
-        // Take screenshot before clicking to verify state
-        const beforeState = await page.evaluate(() => {
-          const tbill = document.getElementById('ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
-          const col11 = document.getElementById('ContentPlaceHolder1_SelectedColumnsCheckBoxList_11');
-          return {
-            tbillChecked: tbill ? tbill.checked : null,
-            yieldColChecked: col11 ? col11.checked : null,
-          };
-        });
-        console.log('Before click state:', JSON.stringify(beforeState));
+        // Click Display
+        await page.click('#ContentPlaceHolder1_DisplayButton');
 
-        // Click Display — ASP.NET UpdatePanel uses partial postback
-        // Use evaluate to directly submit form
-        await page.evaluate(() => {
-          const btn = document.getElementById('ContentPlaceHolder1_DisplayButton');
-          if (btn) btn.click();
-        });
+        // Wait for table to appear in DOM — up to 15 seconds
+        try {
+          await page.waitForFunction(
+            () => {
+              const tables = document.querySelectorAll('table');
+              for (const t of tables) {
+                const rows = t.querySelectorAll('tr');
+                if (rows.length > 3) return true;
+              }
+              return false;
+            },
+            { timeout: 15000 }
+          );
+        } catch(e) {
+          console.log('waitForFunction timed out — extracting anyway');
+        }
 
-        // Wait for UpdatePanel to complete (AJAX partial postback)
-        await new Promise(r => setTimeout(r, 8000));
-
-        // Extract all text and tables
+        // Extract table data
         const tableData = await page.evaluate(() => {
           const results = [];
           document.querySelectorAll('table').forEach((table, tIdx) => {
@@ -174,16 +177,16 @@ export async function GET(request) {
           return results;
         });
 
-        // Also get full page text to see what loaded
-        const pageText = await page.evaluate(() => document.body.innerText);
+        const pageText = await page.evaluate(() => document.body.innerText.slice(800, 3000));
 
-        return { tableData, pageText: pageText.slice(800, 3000), beforeState };
+        return { tableData, pageText, ajaxResponses: ajaxResponses.slice(0, 5) };
       }
     `);
 
     const rows = result?.tableData || [];
     const pageText = result?.pageText || '';
-    console.log('Rows:', rows.length, 'beforeState:', JSON.stringify(result?.beforeState));
+    const ajaxResponses = result?.ajaxResponses || [];
+    console.log('Rows:', rows.length, 'AJAX responses:', ajaxResponses.length);
 
     // Parse rows
     const auctions = [];
@@ -236,7 +239,7 @@ export async function GET(request) {
         sampleRows: rows.slice(0, 20),
         pageTextPreview: pageText,
         colMap,
-        beforeState: result?.beforeState,
+        ajaxResponses,
       });
     }
 
