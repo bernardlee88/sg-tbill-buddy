@@ -113,48 +113,56 @@ export async function GET(request) {
 
     const html = await res.text();
 
-    // Parse 6-month T-bill table
-    const sixMonthAuctions = [];
-    const oneYearAuctions = [];
-
-    // Extract table rows using regex on the markdown-like HTML
-    // Row format: | date | date | date | date | code | status | yield | price |
-    const rowPattern = /\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\w+)\s*\|\s*(\w+)\s*\|\s*([\d.]*)\s*\|\s*([\d.]*)\s*\|/g;
-
-    // Find 6-month section
-    const sixMonthSection = html.match(/6-Month T-bill[\s\S]*?(?=1-Year T-bill|##)/i)?.[0] || '';
-    const oneYearSection = html.match(/1-Year T-bill[\s\S]*?(?=2-Year|##)/i)?.[0] || '';
-
-    function parseSection(sectionHtml, tenor) {
+    // Parse HTML tables from ilovessb.com
+    function parseTbillSection(htmlStr, tenor) {
       const results = [];
-      let match;
-      const re = /\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*(\d{1,2}\s+\w{3}\s+\d{4})\s*\|\s*([A-Z0-9]+)\s*\|\s*(\w+)\s*\|\s*([\d.]*)\s*\|\s*([\d.]*)\s*\|/g;
-      while ((match = re.exec(sectionHtml)) !== null) {
-        const [, announcement, auction, issue, maturity, code, status, yieldVal, price] = match;
-        const auctionDate = normaliseDate(auction);
-        const maturityDate = normaliseDate(maturity);
-        const issueDate = normaliseDate(issue);
-        const tenorDays = tenor === '1-year' ? 364 : 182;
-
-        const entry = {
-          auction_date: auctionDate,
-          issue_date: issueDate,
-          maturity_date: maturityDate,
+      const tenorDays = tenor === '1-year' ? 364 : 182;
+      const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+      let trMatch;
+      while ((trMatch = trRegex.exec(htmlStr)) !== null) {
+        const rowHtml = trMatch[1];
+        const cells = [];
+        const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+        let tdMatch;
+        while ((tdMatch = tdRegex.exec(rowHtml)) !== null) {
+          const text = tdMatch[1]
+            .replace(/<[^>]*>/g, '')
+            .replace(/&amp;/g, '&')
+            .replace(/&nbsp;/g, ' ')
+            .trim();
+          cells.push(text);
+        }
+        if (cells.length < 6) continue;
+        // Columns: Announcement, Auction, Issue, Maturity, Code, Status, Yield, Price
+        const dateRe = /^\d{1,2}\s+\w{3}\s+\d{4}$/;
+        if (!dateRe.test(cells[1])) continue; // auction date in col 1
+        const yieldVal = cells[6] || '';
+        const price = cells[7] || '';
+        results.push({
+          auction_date: normaliseDate(cells[1]),
+          issue_date: normaliseDate(cells[2]),
+          maturity_date: normaliseDate(cells[3]),
           tenor,
-          code: code.trim(),
-          status: status.trim().toLowerCase(),
+          code: (cells[4] || '').trim(),
+          status: (cells[5] || '').trim().toLowerCase(),
           cutoff_yield: yieldVal ? yieldVal + '%' : null,
           cutoff_price: price || (yieldVal ? calcCutoffPrice(yieldVal, tenorDays) : null),
-        };
-
-        results.push(entry);
+        });
       }
       return results;
     }
 
-    const sixMonthData = parseSection(sixMonthSection, '6-month');
-    const oneYearData = parseSection(oneYearSection, '1-year');
-    const allData = [...sixMonthData, ...oneYearData];
+    const sixMonthIdx = html.indexOf('6-Month T-bill');
+    const oneYearIdx = html.indexOf('1-Year T-bill');
+    const twoYearIdx = html.indexOf('2-Year SGS');
+
+    const sixMonthSection = sixMonthIdx >= 0 ? html.slice(sixMonthIdx, oneYearIdx > sixMonthIdx ? oneYearIdx : sixMonthIdx + 5000) : '';
+    const oneYearSection = oneYearIdx >= 0 ? html.slice(oneYearIdx, twoYearIdx > oneYearIdx ? twoYearIdx : oneYearIdx + 3000) : '';
+
+    const allData = [
+      ...parseTbillSection(sixMonthSection, '6-month'),
+      ...parseTbillSection(oneYearSection, '1-year'),
+    ];
 
     console.log('Parsed', allData.length, 'entries from ilovessb');
 
