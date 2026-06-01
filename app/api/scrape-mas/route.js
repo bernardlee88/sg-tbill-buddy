@@ -75,8 +75,10 @@ export async function GET(request) {
 
   try {
     const supabase = getSupabaseClient();
-    const currentYear = new Date().getFullYear().toString();
-    const startYear = (new Date().getFullYear() - 1).toString();
+    const now = new Date();
+    const currentYear = now.getFullYear().toString();
+    const currentMonth = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][now.getMonth()];
+    const startYear = (now.getFullYear() - 1).toString();
 
     const result = await browserlessRequest(`
       export default async function ({ page }) {
@@ -128,7 +130,7 @@ export async function GET(request) {
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${currentYear}');
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', 'Jan');
-        await page.select('#ContentPlaceHolder1_EndMonthDropDownList', 'Dec');
+        await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${currentMonth}');
         try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
         // Uncheck all column checkboxes then check needed ones
