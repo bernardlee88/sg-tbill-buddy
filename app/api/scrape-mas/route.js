@@ -104,12 +104,20 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Fetch ilovessb.com/sgs — no Browserless needed, plain fetch works
-    const res = await fetch('https://www.ilovessb.com/sgs', {
-      headers: { 'User-Agent': 'SGTBillBuddy/1.0' },
-    });
+    // ilovessb.com blocks Vercel IPs — use Browserless to fetch with real browser fingerprint
+    const apiKey = process.env.BROWSERLESS_API_KEY;
+    if (!apiKey) throw new Error('Missing BROWSERLESS_API_KEY');
 
-    if (!res.ok) throw new Error('ilovessb fetch error: ' + res.status);
+    const res = await fetch(
+      'https://chrome.browserless.io/content?token=' + apiKey,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: 'https://www.ilovessb.com/sgs', waitFor: 3000 }),
+      }
+    );
+
+    if (!res.ok) throw new Error('Browserless fetch error: ' + res.status);
 
     const html = await res.text();
 
@@ -167,10 +175,18 @@ export async function GET(request) {
     console.log('Parsed', allData.length, 'entries from ilovessb');
 
     if (allData.length === 0) {
+      // Check if tables exist in the HTML at all
+      const tableCount = (html.match(/<table/g) || []).length;
+      const tdCount = (html.match(/<td/g) || []).length;
+      const sixMonthFound = html.includes('6-Month T-bill');
       return Response.json({
         success: false,
         message: 'Could not parse ilovessb data',
-        htmlPreview: html.slice(0, 500),
+        tableCount,
+        tdCount,
+        sixMonthFound,
+        sixMonthSectionPreview: sixMonthSection.slice(0, 300),
+        htmlLength: html.length,
       });
     }
 
