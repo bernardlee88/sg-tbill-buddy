@@ -78,14 +78,15 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Calculate 12 months ago
+    // Calculate 8 months ago — narrow range ensures we get the most recent auctions
+    // MAS page shows max ~33 rows; 8 months = ~16 auctions so all fit
     const now = new Date();
-    const twelveMonthsAgo = new Date(now);
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+    const eightMonthsAgo = new Date(now);
+    eightMonthsAgo.setMonth(eightMonthsAgo.getMonth() - 8);
 
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const startYear = twelveMonthsAgo.getFullYear().toString();
-    const startMonth = MONTHS[twelveMonthsAgo.getMonth()];
+    const startYear = eightMonthsAgo.getFullYear().toString();
+    const startMonth = MONTHS[eightMonthsAgo.getMonth()];
     const endYear = now.getFullYear().toString();
     const endMonth = MONTHS[now.getMonth()];
 
@@ -127,6 +128,11 @@ export async function GET(request) {
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${endYear}');
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', '${startMonth}');
         await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${endMonth}');
+
+        // Select Maturity Date radio to get results sorted with most recent last
+        // Then we reverse the parsed results to get most recent first
+        const issueDateRadio = await page.$('#ContentPlaceHolder1_IssueDateRadioButton');
+        if (issueDateRadio) await issueDateRadio.click();
         try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
         // Select columns: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
