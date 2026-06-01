@@ -1,6 +1,6 @@
 // app/api/scrape-mas/route.js
-// Scrapes T-Bill auction results from Growbeansprout
-// Growbeansprout publishes every MAS T-bill result reliably after each auction
+// Scrapes T-Bill auction results automatically
+// Strategy: fetch individual Growbeansprout allotment articles + MAS eServices table
 // Cron: every Thursday at 6pm SGT (10:00 UTC)
 
 import { createClient } from '@supabase/supabase-js';
@@ -54,18 +54,53 @@ async function saveAuctions(supabase, auctions) {
         { onConflict: 'auction_date,tenor' }
       );
     if (!error) saved++;
-    else console.error('Upsert error for', auction.auction_date, ':', error.message);
+    else console.error('Upsert error:', error.message);
   }
   return saved;
 }
 
-// Calculate cut-off price from yield and tenor days
 function calcCutoffPrice(yieldPct, tenorDays) {
   const y = parseFloat(yieldPct) / 100;
   const t = parseInt(tenorDays);
   if (isNaN(y) || isNaN(t) || y <= 0) return null;
-  const price = 100 - (100 * y * t / 365);
-  return price.toFixed(3);
+  return (100 - 100 * y * t / 365).toFixed(3);
+}
+
+// Build Growbeansprout article URL for a given auction date
+function buildGrowbeansproutUrl(dateStr) {
+  // dateStr format: "21 May 2026"
+  const parts = dateStr.split(' ');
+  if (parts.length !== 3) return null;
+  const day = parts[0];
+  const month = parts[1].toLowerCase();
+  const year = parts[2];
+  return 'https://growbeansprout.com/t-bill-allotment-' + day + '-' + month + '-' + year;
+}
+
+// Generate a list of expected auction dates for the last 6 months
+// T-bills auction every ~2 weeks on Thursdays
+function getExpectedAuctionDates() {
+  const dates = [];
+  const now = new Date();
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  // Go back 6 months, check every Thursday
+  const start = new Date(now);
+  start.setMonth(start.getMonth() - 6);
+
+  const d = new Date(start);
+  // Move to next Thursday
+  d.setDate(d.getDate() + (4 - d.getDay() + 7) % 7);
+
+  while (d <= now) {
+    const day = d.getDate().toString().padStart(2, '0');
+    const month = MONTHS[d.getMonth()];
+    const year = d.getFullYear();
+    dates.push(day + ' ' + month + ' ' + year);
+    d.setDate(d.getDate() + 14); // next auction ~2 weeks later
+  }
+
+  return dates;
 }
 
 export async function GET(request) {
@@ -89,147 +124,120 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Step 1 — Scrape Growbeansprout T-bill results page
-    const result = await browserlessRequest(`
-      export default async function ({ page }) {
-        await page.goto('https://growbeansprout.com/singapore-t-bill-cut-off-yield', {
-          waitUntil: 'networkidle2',
-          timeout: 30000,
-        });
+    // Get already saved auction dates to avoid re-scraping
+    const { data: existing } = await supabase
+      .from('tbill_auctions')
+      .select('auction_date, tenor')
+      .order('scraped_at', { ascending: false })
+      .limit(50);
 
-        await new Promise(r => setTimeout(r, 2000));
+    const existingKeys = new Set((existing || []).map(r => r.auction_date + '|' + r.tenor));
 
-        // Extract all text content and any tables
-        const pageText = await page.evaluate(() => document.body.innerText);
+    // Get expected auction dates for last 6 months
+    const expectedDates = getExpectedAuctionDates();
+    console.log('Checking', expectedDates.length, 'expected auction dates');
 
-        const tableData = await page.evaluate(() => {
-          const results = [];
-          document.querySelectorAll('table').forEach((table, tIdx) => {
-            table.querySelectorAll('tr').forEach((row, rIdx) => {
-              const cells = Array.from(row.querySelectorAll('th, td')).map(c => c.innerText.trim());
-              if (cells.length > 0) results.push({ tableIdx: tIdx, rowIdx: rIdx, cells });
+    // Find which ones we're missing
+    const missing = expectedDates.filter(d =>
+      !existingKeys.has(d + '|6-month') && !existingKeys.has(d + '|1-year')
+    );
+
+    console.log('Missing dates:', missing);
+
+    if (missing.length === 0) {
+      return Response.json({
+        success: true,
+        message: 'All recent auctions already in database',
+        checked: expectedDates.length,
+      });
+    }
+
+    // Scrape Growbeansprout articles for missing dates
+    const allAuctions = [];
+
+    for (const dateStr of missing.slice(0, 5)) { // max 5 per run
+      const url = buildGrowbeansproutUrl(dateStr);
+      if (!url) continue;
+
+      console.log('Scraping:', url);
+
+      try {
+        const result = await browserlessRequest(`
+          export default async function ({ page }) {
+            await page.goto('${url}', {
+              waitUntil: 'networkidle2',
+              timeout: 20000,
             });
-          });
-          return results;
-        });
 
-        return { pageText: pageText.slice(0, 5000), tableData };
-      }
-    `);
+            const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));
+            const title = await page.title();
+            return { text, title, url: '${url}' };
+          }
+        `);
 
-    const pageText = result?.pageText || '';
-    const tableRows = result?.tableData || [];
+        const text = result?.text || '';
+        const title = result?.title || '';
 
-    console.log('Growbeansprout page text length:', pageText.length);
-    console.log('Table rows:', tableRows.length);
-
-    const auctions = [];
-    const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 };
-    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-    // Parse table rows if available
-    if (tableRows.length > 0) {
-      let headerFound = false;
-      let colMap = {};
-
-      for (const row of tableRows) {
-        const cells = row.cells || [];
-        if (cells.length < 2) continue;
-        const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
-
-        if (!headerFound && normCells.some(c => /date|yield|tenor/i.test(c))) {
-          headerFound = true;
-          normCells.forEach((c, i) => {
-            const norm = c.toLowerCase();
-            if (/date/.test(norm)) colMap.date = i;
-            if (/yield/.test(norm)) colMap.yield = i;
-            if (/tenor|type|month/.test(norm)) colMap.tenor = i;
-          });
+        // Skip if page not found
+        if (text.includes('Page not found') || text.includes('404')) {
+          console.log('Page not found:', url);
           continue;
         }
 
-        if (!headerFound) continue;
+        console.log('Page found:', title.slice(0, 80));
 
-        const dateCell = colMap.date !== undefined ? normCells[colMap.date] : normCells.find(c => /\d{1,2}[\s\/]\w+[\s\/]\d{4}|\d{2}\/\d{2}\/\d{4}/.test(c));
-        const yieldCell = colMap.yield !== undefined ? normCells[colMap.yield] : normCells.find(c => /^\d+\.\d+%?$/.test(c) && parseFloat(c) < 15);
-        const tenorCell = colMap.tenor !== undefined ? normCells[colMap.tenor] : '';
+        // Extract yield from text — look for patterns like "1.45%" near the date
+        const yieldMatch = text.match(/cut.off yield[^.]*?([\d.]+)%/i) ||
+                           text.match(/([\d.]+)%[^.]*?cut.off yield/i) ||
+                           text.match(/yield of ([\d.]+)%/i) ||
+                           text.match(/([\d.]+)%\s+in the auction/i);
 
-        if (!dateCell || !yieldCell) continue;
+        if (!yieldMatch) {
+          console.log('No yield found in:', url);
+          continue;
+        }
 
-        const yieldVal = parseFloat(yieldCell.replace('%', ''));
-        if (isNaN(yieldVal) || yieldVal <= 0) continue;
+        const yieldVal = parseFloat(yieldMatch[1]);
+        if (isNaN(yieldVal) || yieldVal <= 0 || yieldVal >= 15) continue;
 
-        const tenor = /1.year|1-year|12.month|364/i.test(tenorCell + normCells.join(' ')) ? '1-year' : '6-month';
-        const tenorDays = tenor === '1-year' ? 364 : 182;
-        const price = calcCutoffPrice(yieldVal, tenorDays);
-
-        auctions.push({
-          auction_date: dateCell.trim(),
-          tenor,
-          cutoff_yield: yieldVal.toFixed(2) + '%',
-          cutoff_price: price,
-          maturity_date: null,
-        });
-      }
-    }
-
-    // Parse from page text using regex if table parsing got nothing
-    if (auctions.length === 0) {
-      // Match patterns like "21 May 2026" or "21 May" followed by a yield like "1.45%"
-      const pattern = /(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})[^\n]*?([\d.]+)%/gi;
-      let match;
-      while ((match = pattern.exec(pageText)) !== null) {
-        const day = match[1].padStart(2, '0');
-        const month = match[2];
-        const year = match[3];
-        const yieldVal = parseFloat(match[4]);
-
-        if (yieldVal <= 0 || yieldVal >= 15) continue;
-
-        const dateStr = day + ' ' + month + ' ' + year;
-        const contextAround = pageText.slice(Math.max(0, match.index - 50), match.index + 100).toLowerCase();
-        const tenor = /1.year|1-year|364|one year/i.test(contextAround) ? '1-year' : '6-month';
+        // Determine tenor from title/URL
+        const tenor = /1.year|one.year|1-year|by\d/i.test(title + url) ? '1-year' : '6-month';
         const tenorDays = tenor === '1-year' ? 364 : 182;
 
-        auctions.push({
+        console.log('Found:', dateStr, tenor, yieldVal + '%');
+
+        allAuctions.push({
           auction_date: dateStr,
           tenor,
           cutoff_yield: yieldVal.toFixed(2) + '%',
           cutoff_price: calcCutoffPrice(yieldVal, tenorDays),
           maturity_date: null,
         });
+
+        await new Promise(r => setTimeout(r, 1000)); // polite delay
+
+      } catch (err) {
+        console.error('Error scraping', url, ':', err.message);
       }
     }
 
-    // Deduplicate
-    const seen = new Set();
-    const unique = auctions.filter(a => {
-      const key = a.auction_date + '|' + a.tenor;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    console.log('Parsed', unique.length, 'auctions from Growbeansprout');
-
-    if (unique.length === 0) {
-      // If Growbeansprout page structure changed, fall back to MAS eServices
+    if (allAuctions.length === 0) {
       return Response.json({
         success: false,
-        message: 'Could not parse from Growbeansprout. Page may have changed structure.',
-        pageTextPreview: pageText.slice(0, 500),
-        tableRows: tableRows.slice(0, 5),
+        message: 'No new auction data found. Checked ' + missing.length + ' dates.',
+        missing,
+        checked: expectedDates,
       });
     }
 
-    const saved = await saveAuctions(supabase, unique);
+    const saved = await saveAuctions(supabase, allAuctions);
 
     return Response.json({
       success: true,
       source: 'growbeansprout',
-      scraped: unique.length,
+      scraped: allAuctions.length,
       saved,
-      sample: unique.slice(0, 5),
+      sample: allAuctions,
     });
 
   } catch (err) {
