@@ -20,6 +20,16 @@ export default function AuctionsPage() {
       });
   }, []);
 
+  // Upcoming auction dates from MAS 2026 Issuance Calendar
+  const UPCOMING = [
+    { date: '04 Jun 2026', tenor: '6-month', applicationDeadline: '03 Jun 2026 (9pm)' },
+    { date: '18 Jun 2026', tenor: '6-month', applicationDeadline: '17 Jun 2026 (9pm)' },
+    { date: '02 Jul 2026', tenor: '6-month', applicationDeadline: '01 Jul 2026 (9pm)' },
+    { date: '16 Jul 2026', tenor: '1-year', applicationDeadline: '15 Jul 2026 (9pm)' },
+    { date: '16 Jul 2026', tenor: '6-month', applicationDeadline: '15 Jul 2026 (9pm)' },
+    { date: '30 Jul 2026', tenor: '6-month', applicationDeadline: '29 Jul 2026 (9pm)' },
+  ].filter(a => new Date(a.date) > new Date());
+
   return (
     <>
       <div className="page-header">
@@ -31,6 +41,33 @@ export default function AuctionsPage() {
 
       <section className="section">
         <div className="container">
+
+          {/* Upcoming auctions */}
+          {UPCOMING.length > 0 && (
+            <div style={{ marginBottom: '32px' }}>
+              <div className="section-label">Coming Up</div>
+              <h2 style={{ fontSize: '20px', fontWeight: '700', marginBottom: '16px', color: 'var(--gray-900)' }}>Upcoming Auctions</h2>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
+                {UPCOMING.map((a, i) => (
+                  <div key={i} style={{ background: 'white', border: '1px solid var(--gray-200)', borderTop: '3px solid var(--red)', borderRadius: '10px', padding: '16px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
+                      <div style={{ fontFamily: 'Playfair Display, serif', fontSize: '16px', fontWeight: '700', color: 'var(--gray-900)' }}>{a.date}</div>
+                      <span className={a.tenor === '1-year' ? 'badge badge-gold' : 'badge badge-red'}>{a.tenor}</span>
+                    </div>
+                    <div style={{ fontSize: '12px', color: 'var(--gray-400)', marginBottom: '12px' }}>
+                      Apply by: {a.applicationDeadline}
+                    </div>
+                    <a href="/guide" style={{ fontSize: '12px', color: 'var(--red)', fontWeight: '600', textDecoration: 'none' }}>
+                      How to apply →
+                    </a>
+                  </div>
+                ))}
+              </div>
+              <p style={{ fontSize: '11px', color: 'var(--gray-400)', marginTop: '10px' }}>
+                Source: MAS 2026 Issuance Calendar. Application deadlines are for cash applications via internet banking. CPF/SRS deadlines may differ — check with your bank.
+              </p>
+            </div>
+          )}
 
           {/* MAS link callout */}
           <div style={{ background: 'white', border: '1px solid var(--gray-200)', borderLeft: '4px solid var(--red)', borderRadius: '8px', padding: '16px 20px', marginBottom: '32px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
