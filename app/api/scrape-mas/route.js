@@ -1,5 +1,6 @@
 // app/api/scrape-mas/route.js
-// Scrapes latest 12 months of MAS T-Bill auction results using Browserless
+// Scrapes MAS T-Bill auction results using Browserless
+// Uses the Download CSV button for reliable data extraction
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -78,22 +79,40 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Calculate 8 months ago — narrow range ensures we get the most recent auctions
-    // MAS page shows max ~33 rows; 8 months = ~16 auctions so all fit
     const now = new Date();
-    const eightMonthsAgo = new Date(now);
-    eightMonthsAgo.setMonth(eightMonthsAgo.getMonth() - 8);
-
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const startYear = eightMonthsAgo.getFullYear().toString();
-    const startMonth = MONTHS[eightMonthsAgo.getMonth()];
+
+    // Set date range: 2 years back to now to ensure we get all recent auctions
+    const twoYearsAgo = new Date(now);
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    const startYear = twoYearsAgo.getFullYear().toString();
+    const startMonth = MONTHS[twoYearsAgo.getMonth()];
     const endYear = now.getFullYear().toString();
     const endMonth = MONTHS[now.getMonth()];
 
-    console.log('Scraping', startMonth, startYear, 'to', endMonth, endYear);
-
     const result = await browserlessRequest(`
       export default async function ({ page }) {
+        // Intercept the download request to capture CSV data
+        let csvData = null;
+
+        await page.setRequestInterception(true);
+
+        page.on('request', req => {
+          req.continue();
+        });
+
+        page.on('response', async res => {
+          const ct = res.headers()['content-type'] || '';
+          const cd = res.headers()['content-disposition'] || '';
+          if (ct.includes('text/csv') || ct.includes('application/csv') ||
+              ct.includes('application/octet-stream') || cd.includes('.csv') ||
+              cd.includes('attachment')) {
+            try {
+              csvData = await res.text();
+            } catch(e) {}
+          }
+        });
+
         await page.goto('https://eservices.mas.gov.sg/statistics/fdanet/BondTreasuryBillsCMTBsAuctions.aspx', {
           waitUntil: 'networkidle2',
           timeout: 30000,
@@ -123,19 +142,14 @@ export async function GET(request) {
         await page.click('#ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
         await new Promise(r => setTimeout(r, 300));
 
-        // Set date range — last 12 months
+        // Set date range
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
         await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${endYear}');
         await page.select('#ContentPlaceHolder1_StartMonthDropDownList', '${startMonth}');
         await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${endMonth}');
-
-        // Select Maturity Date radio to get results sorted with most recent last
-        // Then we reverse the parsed results to get most recent first
-        const issueDateRadio = await page.$('#ContentPlaceHolder1_IssueDateRadioButton');
-        if (issueDateRadio) await issueDateRadio.click();
         try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
-        // Select columns: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
+        // Select all useful columns
         for (let i = 0; i <= 16; i++) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
           if (el) {
@@ -149,20 +163,29 @@ export async function GET(request) {
           if (el) { await el.click(); await new Promise(r => setTimeout(r, 100)); }
         }
 
-        // Click Display
+        // Click Display first to load results
         await page.evaluate(() => {
           document.getElementById('ContentPlaceHolder1_DisplayButton').click();
         });
 
-        // Wait for table to appear
         try {
           await page.waitForFunction(
             () => Array.from(document.querySelectorAll('table')).some(t => t.querySelectorAll('tr').length > 3),
             { timeout: 15000 }
           );
-        } catch(e) { console.log('waitForFunction timed out'); }
+        } catch(e) {}
 
-        // Extract table
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Now click Download button to get CSV
+        await page.evaluate(() => {
+          const btn = document.getElementById('ContentPlaceHolder1_DownloadButton');
+          if (btn) btn.click();
+        });
+
+        await new Promise(r => setTimeout(r, 5000));
+
+        // Also grab table data as fallback
         const tableData = await page.evaluate(() => {
           const results = [];
           document.querySelectorAll('table').forEach((table, tIdx) => {
@@ -174,32 +197,89 @@ export async function GET(request) {
           return results;
         });
 
-        // Check for pagination links
-        const pagination = await page.evaluate(() => {
-          const links = Array.from(document.querySelectorAll('a, input[type="submit"]'));
-          return links
-            .filter(l => {
-              const t = (l.innerText || l.value || '').trim().toLowerCase();
-              return t === 'next' || t === '>' || t === 'next page' || t === '2' || t.includes('next');
-            })
-            .map(l => ({ text: l.innerText || l.value, id: l.id, href: l.href }));
-        });
-
-        return { tableData, pagination };
+        return { tableData, csvData };
       }
     `);
 
-    const rows = result?.tableData || [];
-    const pagination = result?.pagination || [];
-    console.log('Got', rows.length, 'rows, pagination:', JSON.stringify(pagination));
+    const csvData = result?.csvData;
+    const tableRows = result?.tableData || [];
 
-    // Parse rows
+    // Parse CSV if available
+    if (csvData && csvData.length > 100) {
+      console.log('Got CSV data, length:', csvData.length);
+      const lines = csvData.split('\n').filter(l => l.trim());
+      const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const auctions = [];
+      let headers = [];
+
+      for (const line of lines) {
+        const cells = line.split(',').map(c => c.replace(/^"|"$/g, '').trim());
+        if (cells.length < 3) continue;
+
+        if (headers.length === 0 && cells.some(c => /issue.?date|cut.?off/i.test(c))) {
+          headers = cells.map(c => c.toLowerCase());
+          continue;
+        }
+
+        if (headers.length === 0) continue;
+
+        const issueDateIdx = headers.findIndex(h => /issue.?date/.test(h));
+        const maturityIdx = headers.findIndex(h => /maturity.?date/.test(h));
+        const yieldIdx = headers.findIndex(h => /cut.?off yield/.test(h));
+        const priceIdx = headers.findIndex(h => /cut.?off price/.test(h));
+        const termIdx = headers.findIndex(h => /term|tenor/.test(h));
+
+        const issueDate = issueDateIdx >= 0 ? cells[issueDateIdx] : null;
+        const maturityDate = maturityIdx >= 0 ? cells[maturityIdx] : null;
+        const yieldVal = yieldIdx >= 0 ? cells[yieldIdx] : null;
+        const price = priceIdx >= 0 ? cells[priceIdx] : null;
+        const termDays = termIdx >= 0 ? cells[termIdx] : cells[0];
+
+        if (!issueDate || !yieldVal) continue;
+
+        let formattedDate = issueDate;
+        if (/\d{2}\/\d{2}\/\d{4}/.test(issueDate)) {
+          const [d, m, y] = issueDate.split('/');
+          formattedDate = d + ' ' + MONTH_NAMES[parseInt(m) - 1] + ' ' + y;
+        }
+
+        let formattedMaturity = maturityDate;
+        if (maturityDate && /\d{2}\/\d{2}\/\d{4}/.test(maturityDate)) {
+          const [d, m, y] = maturityDate.split('/');
+          formattedMaturity = d + ' ' + MONTH_NAMES[parseInt(m) - 1] + ' ' + y;
+        }
+
+        const days = parseInt(termDays) || 182;
+        const tenor = days >= 350 ? '1-year' : '6-month';
+
+        auctions.push({
+          auction_date: formattedDate,
+          tenor,
+          cutoff_yield: parseFloat(yieldVal).toFixed(2) + '%',
+          cutoff_price: price || null,
+          maturity_date: formattedMaturity || null,
+        });
+      }
+
+      if (auctions.length > 0) {
+        const saved = await saveAuctions(supabase, auctions);
+        return Response.json({
+          success: true,
+          source: 'csv',
+          scraped: auctions.length,
+          saved,
+          sample: auctions.slice(-5), // last 5 = most recent
+        });
+      }
+    }
+
+    // Fallback: parse table rows (same logic as before)
     const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     const auctions = [];
     let headerFound = false;
     let colMap = {};
 
-    for (const row of rows) {
+    for (const row of tableRows) {
       const cells = row.cells || [];
       if (cells.length < 2) continue;
       const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
@@ -250,27 +330,22 @@ export async function GET(request) {
       });
     }
 
-    console.log('Parsed', auctions.length, 'auctions');
-
     if (auctions.length === 0) {
       return Response.json({
         success: false,
         message: 'Could not parse auction data.',
-        rowCount: rows.length,
-        sampleRows: rows.slice(0, 10),
-        pagination,
+        rowCount: tableRows.length,
+        csvLength: csvData ? csvData.length : 0,
       });
     }
 
     const saved = await saveAuctions(supabase, auctions);
-
     return Response.json({
       success: true,
+      source: 'table',
       scraped: auctions.length,
       saved,
-      range: startMonth + ' ' + startYear + ' to ' + endMonth + ' ' + endYear,
-      pagination,
-      sample: auctions.slice(0, 3),
+      sample: auctions.slice(-5),
     });
 
   } catch (err) {
