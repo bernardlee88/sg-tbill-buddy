@@ -174,12 +174,24 @@ export async function GET(request) {
           return results;
         });
 
-        return { tableData };
+        // Check for pagination links
+        const pagination = await page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a, input[type="submit"]'));
+          return links
+            .filter(l => {
+              const t = (l.innerText || l.value || '').trim().toLowerCase();
+              return t === 'next' || t === '>' || t === 'next page' || t === '2' || t.includes('next');
+            })
+            .map(l => ({ text: l.innerText || l.value, id: l.id, href: l.href }));
+        });
+
+        return { tableData, pagination };
       }
     `);
 
     const rows = result?.tableData || [];
-    console.log('Got', rows.length, 'rows');
+    const pagination = result?.pagination || [];
+    console.log('Got', rows.length, 'rows, pagination:', JSON.stringify(pagination));
 
     // Parse rows
     const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -246,6 +258,7 @@ export async function GET(request) {
         message: 'Could not parse auction data.',
         rowCount: rows.length,
         sampleRows: rows.slice(0, 10),
+        pagination,
       });
     }
 
@@ -256,6 +269,7 @@ export async function GET(request) {
       scraped: auctions.length,
       saved,
       range: startMonth + ' ' + startYear + ' to ' + endMonth + ' ' + endYear,
+      pagination,
       sample: auctions.slice(0, 3),
     });
 
