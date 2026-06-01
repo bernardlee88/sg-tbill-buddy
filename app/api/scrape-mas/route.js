@@ -178,18 +178,14 @@ export async function GET(request) {
       for (const url of urls) {
         console.log('Trying:', url);
         try {
-          const r = await browserlessRequest(`
-            export default async function ({ page }) {
-              await page.goto('${url}', {
-                waitUntil: 'networkidle2',
-                timeout: 20000,
-              });
-              const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));
-              const title = await page.title();
-              const notFound = text.includes('Page not found') || text.includes('404');
-              return { text, title, notFound };
-            }
-          `.replace(/\$\{url\}/g, url));
+          const scrapeCode = 'export default async function ({ page }) {' +
+            'await page.goto(' + JSON.stringify(url) + ', { waitUntil: \'networkidle2\', timeout: 20000 });' +
+            'const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));' +
+            'const title = await page.title();' +
+            'const notFound = text.includes(\'Page not found\') || text.includes(\'404\');' +
+            'return { text, title, notFound };' +
+            '}';
+          const r = await browserlessRequest(scrapeCode);
           if (r && !r.notFound) {
             result = r;
             usedUrl = url;
