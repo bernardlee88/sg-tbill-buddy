@@ -67,14 +67,28 @@ function calcCutoffPrice(yieldPct, tenorDays) {
 }
 
 // Build Growbeansprout article URL for a given auction date
+// Growbeansprout uses no leading zeros and sometimes full month names
 function buildGrowbeansproutUrl(dateStr) {
-  // dateStr format: "21 May 2026"
   const parts = dateStr.split(' ');
   if (parts.length !== 3) return null;
-  const day = parts[0];
-  const month = parts[1].toLowerCase();
+  const day = parseInt(parts[0]).toString(); // strip leading zero
+  const monthFull = parts[1].toLowerCase();
   const year = parts[2];
-  return 'https://growbeansprout.com/t-bill-allotment-' + day + '-' + month + '-' + year;
+
+  // Try both abbreviated and full month names
+  const fullMonths = {
+    jan: 'january', feb: 'february', mar: 'march', apr: 'april',
+    may: 'may', jun: 'june', jul: 'july', aug: 'august',
+    sep: 'september', oct: 'october', nov: 'november', dec: 'december'
+  };
+
+  const fullMonth = fullMonths[monthFull] || monthFull;
+
+  // Return array of URLs to try — some articles use full month, some abbreviated
+  return [
+    'https://growbeansprout.com/t-bill-allotment-' + day + '-' + fullMonth + '-' + year,
+    'https://growbeansprout.com/t-bill-allotment-' + day + '-' + monthFull + '-' + year,
+  ];
 }
 
 // Known MAS T-bill auction dates — updated from MAS issuance calendar
@@ -155,35 +169,45 @@ export async function GET(request) {
     const allAuctions = [];
 
     for (const dateStr of missing.slice(0, 5)) { // max 5 per run
-      const url = buildGrowbeansproutUrl(dateStr);
-      if (!url) continue;
+      const urls = buildGrowbeansproutUrl(dateStr);
+      if (!urls) continue;
 
-      console.log('Scraping:', url);
+      let result = null;
+      let usedUrl = null;
+
+      for (const url of urls) {
+        console.log('Trying:', url);
+        try {
+          const r = await browserlessRequest(`
+            export default async function ({ page }) {
+              await page.goto('${url}', {
+                waitUntil: 'networkidle2',
+                timeout: 20000,
+              });
+              const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));
+              const title = await page.title();
+              const notFound = text.includes('Page not found') || text.includes('404');
+              return { text, title, notFound };
+            }
+          `.replace(/\$\{url\}/g, url));
+          if (r && !r.notFound) {
+            result = r;
+            usedUrl = url;
+            break;
+          }
+        } catch(e) {
+          console.log('Failed:', url, e.message);
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
 
       try {
-        const result = await browserlessRequest(`
-          export default async function ({ page }) {
-            await page.goto('${url}', {
-              waitUntil: 'networkidle2',
-              timeout: 20000,
-            });
-
-            const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));
-            const title = await page.title();
-            return { text, title, url: '${url}' };
-          }
-        `);
+        if (!result) { console.log('All URLs failed for', dateStr); continue; }
 
         const text = result?.text || '';
         const title = result?.title || '';
 
-        // Skip if page not found
-        if (text.includes('Page not found') || text.includes('404')) {
-          console.log('Page not found:', url);
-          continue;
-        }
-
-        console.log('Page found:', title.slice(0, 80));
+        console.log('Page found:', usedUrl, title.slice(0, 60));
 
         // Extract yield from text — look for patterns like "1.45%" near the date
         const yieldMatch = text.match(/cut.off yield[^.]*?([\d.]+)%/i) ||
