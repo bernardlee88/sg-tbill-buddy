@@ -6,14 +6,12 @@ export default function AuctionsPage() {
   const [auctions, setAuctions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [fallback, setFallback] = useState(false);
 
   useEffect(() => {
     fetch('/api/mas?type=auctions')
       .then(r => r.json())
       .then(data => {
         setAuctions(data.data || []);
-        setFallback(data.fallback || false);
         setLoading(false);
       })
       .catch(() => {
@@ -45,12 +43,6 @@ export default function AuctionsPage() {
             </a>
           </div>
 
-          {fallback && (
-            <div className="disclaimer" style={{ marginBottom: '24px' }}>
-              ⚠️ Live MAS data is temporarily unavailable. Showing sample data for illustration. Please visit mas.gov.sg for current auction details.
-            </div>
-          )}
-
           {loading && (
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--gray-400)' }}>
               <div style={{ fontSize: '32px', marginBottom: '12px' }}>⏳</div>
@@ -60,6 +52,13 @@ export default function AuctionsPage() {
 
           {error && (
             <div className="disclaimer" style={{ marginBottom: '24px' }}>⚠️ {error}</div>
+          )}
+
+          {/* Last updated note */}
+          {!loading && auctions.length > 0 && auctions[0]?.lastUpdated && (
+            <div style={{ fontSize: '12px', color: 'var(--gray-400)', marginBottom: '16px' }}>
+              Data last updated: {auctions[0].lastUpdated} · Source: MAS Treasury Bills Statistics
+            </div>
           )}
 
           {!loading && auctions.length > 0 && (
@@ -92,7 +91,7 @@ export default function AuctionsPage() {
                         <td style={{ color: 'var(--gray-600)' }}>{auction.maturityDate || '—'}</td>
                         <td>
                           <a
-                            href={`/calculator?yield=${(auction.cutoffYield || '').replace('%', '')}`}
+                            href={`/calculator?yield=${(auction.cutoffYield || '').replace('%', '')}&tenor=${auction.tenor === '1-year' ? '364' : '182'}`}
                             style={{ fontSize: '12px', color: 'var(--red)', fontWeight: '600', textDecoration: 'none' }}
                           >
                             Calculate →

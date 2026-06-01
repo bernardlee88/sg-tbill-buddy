@@ -1,6 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { Suspense } from 'react';
 import Link from 'next/link';
 
 function calcTBill(principal, yieldPct, tenorDays) {
@@ -40,10 +42,21 @@ const TENOR_OPTIONS = [
   { label: '1-year (364 days)', days: '364' },
 ];
 
-export default function CalculatorPage() {
+function CalculatorContent() {
+  const searchParams = useSearchParams();
   const [amount, setAmount] = useState('10000');
   const [yieldVal, setYieldVal] = useState('3.48');
   const [tenor, setTenor] = useState('182');
+
+  // Pre-fill from URL params — e.g. /calculator?yield=1.45&tenor=182
+  useEffect(() => {
+    const y = searchParams.get('yield');
+    const t = searchParams.get('tenor');
+    const a = searchParams.get('amount');
+    if (y) setYieldVal(y);
+    if (t) setTenor(t);
+    if (a) setAmount(a);
+  }, [searchParams]);
   const [compareMode, setCompareMode] = useState(false);
   const [amount2, setAmount2] = useState('50000');
   const [yieldVal2, setYieldVal2] = useState('3.48');
@@ -250,5 +263,13 @@ export default function CalculatorPage() {
         </div>
       </section>
     </>
+  );
+}
+
+export default function CalculatorPage() {
+  return (
+    <Suspense fallback={<div style={{ padding: '40px', textAlign: 'center', color: 'var(--gray-400)' }}>Loading...</div>}>
+      <CalculatorContent />
+    </Suspense>
   );
 }
