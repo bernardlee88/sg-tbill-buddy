@@ -102,6 +102,25 @@ export async function GET(request) {
   const latest6m = data.find(d => d.tenor === '6-month');
   const latestYield = latest6m?.cutoffYield?.replace('%', '') || '1.45';
 
+  // Serve upcoming auctions if requested
+  if (type === 'upcoming') {
+    try {
+      const { data: upcomingRows, error } = await supabase
+        .from('tbill_upcoming')
+        .select('*')
+        .order('auction_date', { ascending: true });
+
+      if (!error && upcomingRows && upcomingRows.length > 0) {
+        const now = new Date();
+        const future = upcomingRows.filter(r => new Date(r.auction_date) > now);
+        return Response.json({ success: true, data: future, source: 'supabase' });
+      }
+    } catch (err) {
+      console.error('Upcoming fetch error:', err.message);
+    }
+    return Response.json({ success: true, data: [], source: 'empty' });
+  }
+
   return Response.json({
     success: true,
     data,
