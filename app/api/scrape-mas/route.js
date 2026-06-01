@@ -77,30 +77,29 @@ function buildGrowbeansproutUrl(dateStr) {
   return 'https://growbeansprout.com/t-bill-allotment-' + day + '-' + month + '-' + year;
 }
 
-// Generate a list of expected auction dates for the last 6 months
-// T-bills auction every ~2 weeks on Thursdays
+// Known MAS T-bill auction dates — updated from MAS issuance calendar
+// Source: mas.gov.sg/bonds-and-bills/auctions-and-issuance-calendar
 function getExpectedAuctionDates() {
-  const dates = [];
-  const now = new Date();
-  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-  // Go back 6 months, check every Thursday
-  const start = new Date(now);
-  start.setMonth(start.getMonth() - 6);
-
-  const d = new Date(start);
-  // Move to next Thursday
-  d.setDate(d.getDate() + (4 - d.getDay() + 7) % 7);
-
-  while (d <= now) {
-    const day = d.getDate().toString().padStart(2, '0');
-    const month = MONTHS[d.getMonth()];
-    const year = d.getFullYear();
-    dates.push(day + ' ' + month + ' ' + year);
-    d.setDate(d.getDate() + 14); // next auction ~2 weeks later
-  }
-
-  return dates;
+  return [
+    // 6-month T-bills 2025
+    '07 Jan 2025', '21 Jan 2025', '04 Feb 2025', '18 Feb 2025',
+    '04 Mar 2025', '18 Mar 2025', '01 Apr 2025', '15 Apr 2025',
+    '29 Apr 2025', '13 May 2025', '27 May 2025', '10 Jun 2025',
+    '24 Jun 2025', '08 Jul 2025', '22 Jul 2025', '05 Aug 2025',
+    '19 Aug 2025', '02 Sep 2025', '16 Sep 2025', '30 Sep 2025',
+    '14 Oct 2025', '28 Oct 2025', '11 Nov 2025', '25 Nov 2025',
+    '09 Dec 2025', '23 Dec 2025',
+    // 1-year T-bills 2025
+    '28 Jan 2025', '22 Apr 2025', '29 Jul 2025', '21 Oct 2025',
+    // 6-month T-bills 2026
+    '06 Jan 2026', '15 Jan 2026', '20 Jan 2026', '29 Jan 2026',
+    '12 Feb 2026', '26 Feb 2026',
+    '12 Mar 2026', '26 Mar 2026',
+    '09 Apr 2026', '23 Apr 2026',
+    '07 May 2026', '21 May 2026',
+    // 1-year T-bills 2026
+    '15 Jan 2026', '16 Apr 2026',
+  ];
 }
 
 export async function GET(request) {
