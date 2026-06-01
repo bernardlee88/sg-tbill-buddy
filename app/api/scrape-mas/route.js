@@ -1,6 +1,7 @@
 // app/api/scrape-mas/route.js
-// Scrapes MAS T-Bill auction results using Browserless
-// Uses the Download CSV button for reliable data extraction
+// Scrapes T-Bill auction results from Growbeansprout
+// Growbeansprout publishes every MAS T-bill result reliably after each auction
+// Cron: every Thursday at 6pm SGT (10:00 UTC)
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -53,9 +54,18 @@ async function saveAuctions(supabase, auctions) {
         { onConflict: 'auction_date,tenor' }
       );
     if (!error) saved++;
-    else console.error('Upsert error:', error.message);
+    else console.error('Upsert error for', auction.auction_date, ':', error.message);
   }
   return saved;
+}
+
+// Calculate cut-off price from yield and tenor days
+function calcCutoffPrice(yieldPct, tenorDays) {
+  const y = parseFloat(yieldPct) / 100;
+  const t = parseInt(tenorDays);
+  if (isNaN(y) || isNaN(t) || y <= 0) return null;
+  const price = 100 - (100 * y * t / 365);
+  return price.toFixed(3);
 }
 
 export async function GET(request) {
@@ -79,113 +89,19 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    const now = new Date();
-    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-    // Set date range: 2 years back to now to ensure we get all recent auctions
-    const twoYearsAgo = new Date(now);
-    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-    const startYear = twoYearsAgo.getFullYear().toString();
-    const startMonth = MONTHS[twoYearsAgo.getMonth()];
-    const endYear = now.getFullYear().toString();
-    const endMonth = MONTHS[now.getMonth()];
-
+    // Step 1 — Scrape Growbeansprout T-bill results page
     const result = await browserlessRequest(`
       export default async function ({ page }) {
-        // Intercept the download request to capture CSV data
-        let csvData = null;
-
-        await page.setRequestInterception(true);
-
-        page.on('request', req => {
-          req.continue();
-        });
-
-        page.on('response', async res => {
-          const ct = res.headers()['content-type'] || '';
-          const cd = res.headers()['content-disposition'] || '';
-          if (ct.includes('text/csv') || ct.includes('application/csv') ||
-              ct.includes('application/octet-stream') || cd.includes('.csv') ||
-              cd.includes('attachment')) {
-            try {
-              csvData = await res.text();
-            } catch(e) {}
-          }
-        });
-
-        await page.goto('https://eservices.mas.gov.sg/statistics/fdanet/BondTreasuryBillsCMTBsAuctions.aspx', {
+        await page.goto('https://growbeansprout.com/singapore-t-bill-cut-off-yield', {
           waitUntil: 'networkidle2',
           timeout: 30000,
         });
 
-        await page.waitForSelector('#ContentPlaceHolder1_StartYearDropDownList', { timeout: 10000 });
-
-        // Uncheck all product checkboxes
-        for (const id of [
-          'ContentPlaceHolder1_SGSBondsCheckBox',
-          'ContentPlaceHolder1_SGSBondsMasCheckBoxList_0',
-          'ContentPlaceHolder1_SGSBondsMasCheckBoxList_1',
-          'ContentPlaceHolder1_SGSBondsMasCheckBoxList_2',
-          'ContentPlaceHolder1_TBillsAndCMTBsCheckBox',
-          'ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0',
-          'ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_1',
-        ]) {
-          const el = await page.$('#' + id);
-          if (el) {
-            const checked = await page.evaluate(e => e.checked, el);
-            if (checked) await el.click();
-            await new Promise(r => setTimeout(r, 100));
-          }
-        }
-
-        // Check T-bills only
-        await page.click('#ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
-        await new Promise(r => setTimeout(r, 300));
-
-        // Set date range
-        await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
-        await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${endYear}');
-        await page.select('#ContentPlaceHolder1_StartMonthDropDownList', '${startMonth}');
-        await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${endMonth}');
-        try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
-
-        // Select all useful columns
-        for (let i = 0; i <= 16; i++) {
-          const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
-          if (el) {
-            const checked = await page.evaluate(e => e.checked, el);
-            if (checked) await el.click();
-            await new Promise(r => setTimeout(r, 50));
-          }
-        }
-        for (const i of [3, 6, 7, 11, 12]) {
-          const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
-          if (el) { await el.click(); await new Promise(r => setTimeout(r, 100)); }
-        }
-
-        // Click Display first to load results
-        await page.evaluate(() => {
-          document.getElementById('ContentPlaceHolder1_DisplayButton').click();
-        });
-
-        try {
-          await page.waitForFunction(
-            () => Array.from(document.querySelectorAll('table')).some(t => t.querySelectorAll('tr').length > 3),
-            { timeout: 15000 }
-          );
-        } catch(e) {}
-
         await new Promise(r => setTimeout(r, 2000));
 
-        // Now click Download button to get CSV
-        await page.evaluate(() => {
-          const btn = document.getElementById('ContentPlaceHolder1_DownloadButton');
-          if (btn) btn.click();
-        });
+        // Extract all text content and any tables
+        const pageText = await page.evaluate(() => document.body.innerText);
 
-        await new Promise(r => setTimeout(r, 5000));
-
-        // Also grab table data as fallback
         const tableData = await page.evaluate(() => {
           const results = [];
           document.querySelectorAll('table').forEach((table, tIdx) => {
@@ -197,155 +113,123 @@ export async function GET(request) {
           return results;
         });
 
-        return { tableData, csvData };
+        return { pageText: pageText.slice(0, 5000), tableData };
       }
     `);
 
-    const csvData = result?.csvData;
+    const pageText = result?.pageText || '';
     const tableRows = result?.tableData || [];
 
-    // Parse CSV if available
-    if (csvData && csvData.length > 100) {
-      console.log('Got CSV data, length:', csvData.length);
-      const lines = csvData.split('\n').filter(l => l.trim());
-      const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      const auctions = [];
-      let headers = [];
+    console.log('Growbeansprout page text length:', pageText.length);
+    console.log('Table rows:', tableRows.length);
 
-      for (const line of lines) {
-        const cells = line.split(',').map(c => c.replace(/^"|"$/g, '').trim());
-        if (cells.length < 3) continue;
+    const auctions = [];
+    const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 };
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-        if (headers.length === 0 && cells.some(c => /issue.?date|cut.?off/i.test(c))) {
-          headers = cells.map(c => c.toLowerCase());
+    // Parse table rows if available
+    if (tableRows.length > 0) {
+      let headerFound = false;
+      let colMap = {};
+
+      for (const row of tableRows) {
+        const cells = row.cells || [];
+        if (cells.length < 2) continue;
+        const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
+
+        if (!headerFound && normCells.some(c => /date|yield|tenor/i.test(c))) {
+          headerFound = true;
+          normCells.forEach((c, i) => {
+            const norm = c.toLowerCase();
+            if (/date/.test(norm)) colMap.date = i;
+            if (/yield/.test(norm)) colMap.yield = i;
+            if (/tenor|type|month/.test(norm)) colMap.tenor = i;
+          });
           continue;
         }
 
-        if (headers.length === 0) continue;
+        if (!headerFound) continue;
 
-        const issueDateIdx = headers.findIndex(h => /issue.?date/.test(h));
-        const maturityIdx = headers.findIndex(h => /maturity.?date/.test(h));
-        const yieldIdx = headers.findIndex(h => /cut.?off yield/.test(h));
-        const priceIdx = headers.findIndex(h => /cut.?off price/.test(h));
-        const termIdx = headers.findIndex(h => /term|tenor/.test(h));
+        const dateCell = colMap.date !== undefined ? normCells[colMap.date] : normCells.find(c => /\d{1,2}[\s\/]\w+[\s\/]\d{4}|\d{2}\/\d{2}\/\d{4}/.test(c));
+        const yieldCell = colMap.yield !== undefined ? normCells[colMap.yield] : normCells.find(c => /^\d+\.\d+%?$/.test(c) && parseFloat(c) < 15);
+        const tenorCell = colMap.tenor !== undefined ? normCells[colMap.tenor] : '';
 
-        const issueDate = issueDateIdx >= 0 ? cells[issueDateIdx] : null;
-        const maturityDate = maturityIdx >= 0 ? cells[maturityIdx] : null;
-        const yieldVal = yieldIdx >= 0 ? cells[yieldIdx] : null;
-        const price = priceIdx >= 0 ? cells[priceIdx] : null;
-        const termDays = termIdx >= 0 ? cells[termIdx] : cells[0];
+        if (!dateCell || !yieldCell) continue;
 
-        if (!issueDate || !yieldVal) continue;
+        const yieldVal = parseFloat(yieldCell.replace('%', ''));
+        if (isNaN(yieldVal) || yieldVal <= 0) continue;
 
-        let formattedDate = issueDate;
-        if (/\d{2}\/\d{2}\/\d{4}/.test(issueDate)) {
-          const [d, m, y] = issueDate.split('/');
-          formattedDate = d + ' ' + MONTH_NAMES[parseInt(m) - 1] + ' ' + y;
-        }
-
-        let formattedMaturity = maturityDate;
-        if (maturityDate && /\d{2}\/\d{2}\/\d{4}/.test(maturityDate)) {
-          const [d, m, y] = maturityDate.split('/');
-          formattedMaturity = d + ' ' + MONTH_NAMES[parseInt(m) - 1] + ' ' + y;
-        }
-
-        const days = parseInt(termDays) || 182;
-        const tenor = days >= 350 ? '1-year' : '6-month';
+        const tenor = /1.year|1-year|12.month|364/i.test(tenorCell + normCells.join(' ')) ? '1-year' : '6-month';
+        const tenorDays = tenor === '1-year' ? 364 : 182;
+        const price = calcCutoffPrice(yieldVal, tenorDays);
 
         auctions.push({
-          auction_date: formattedDate,
+          auction_date: dateCell.trim(),
           tenor,
-          cutoff_yield: parseFloat(yieldVal).toFixed(2) + '%',
-          cutoff_price: price || null,
-          maturity_date: formattedMaturity || null,
-        });
-      }
-
-      if (auctions.length > 0) {
-        const saved = await saveAuctions(supabase, auctions);
-        return Response.json({
-          success: true,
-          source: 'csv',
-          scraped: auctions.length,
-          saved,
-          sample: auctions.slice(-5), // last 5 = most recent
+          cutoff_yield: yieldVal.toFixed(2) + '%',
+          cutoff_price: price,
+          maturity_date: null,
         });
       }
     }
 
-    // Fallback: parse table rows (same logic as before)
-    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const auctions = [];
-    let headerFound = false;
-    let colMap = {};
-
-    for (const row of tableRows) {
-      const cells = row.cells || [];
-      if (cells.length < 2) continue;
-      const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
-
-      if (!headerFound && normCells.some(c => /cut.off yield|issue.?date/i.test(c))) {
-        headerFound = true;
-        normCells.forEach((c, i) => {
-          const norm = c.toLowerCase();
-          if (/issue.?date/.test(norm)) colMap.issueDate = i;
-          if (/maturity.?date/.test(norm)) colMap.maturityDate = i;
-          if (/cut.off yield/.test(norm)) colMap.yield = i;
-          if (/cut.off price/.test(norm)) colMap.price = i;
-          if (/term|tenor/.test(norm)) colMap.term = i;
-        });
-        continue;
-      }
-
-      if (!headerFound) continue;
-      if (normCells[0] === 'Bond Auction Results') continue;
-
-      const issueDate = colMap.issueDate !== undefined ? normCells[colMap.issueDate] : normCells.find(c => /\d{2}\/\d{2}\/\d{4}/.test(c));
-      const maturityDate = colMap.maturityDate !== undefined ? normCells[colMap.maturityDate] : null;
-      const yieldVal = colMap.yield !== undefined ? normCells[colMap.yield] : normCells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
-      const price = colMap.price !== undefined ? normCells[colMap.price] : normCells.find(c => /^9[5-9]\.\d+$/.test(c));
-      const termDays = colMap.term !== undefined ? normCells[colMap.term] : normCells[0];
-
-      if (!issueDate || !yieldVal) continue;
-      if (!/\d{2}\/\d{2}\/\d{4}/.test(issueDate)) continue;
-
-      const [day, month, year] = issueDate.split('/');
-      const formattedDate = day + ' ' + MONTH_NAMES[parseInt(month) - 1] + ' ' + year;
-
-      let formattedMaturity = null;
-      if (maturityDate && /\d{2}\/\d{2}\/\d{4}/.test(maturityDate)) {
-        const [md, mm, my] = maturityDate.split('/');
-        formattedMaturity = md + ' ' + MONTH_NAMES[parseInt(mm) - 1] + ' ' + my;
-      }
-
-      const days = parseInt(termDays) || 0;
-      const tenor = days >= 350 ? '1-year' : '6-month';
-
-      auctions.push({
-        auction_date: formattedDate,
-        tenor,
-        cutoff_yield: parseFloat(yieldVal).toFixed(2) + '%',
-        cutoff_price: price || null,
-        maturity_date: formattedMaturity,
-      });
-    }
-
+    // Parse from page text using regex if table parsing got nothing
     if (auctions.length === 0) {
+      // Match patterns like "21 May 2026" or "21 May" followed by a yield like "1.45%"
+      const pattern = /(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})[^\n]*?([\d.]+)%/gi;
+      let match;
+      while ((match = pattern.exec(pageText)) !== null) {
+        const day = match[1].padStart(2, '0');
+        const month = match[2];
+        const year = match[3];
+        const yieldVal = parseFloat(match[4]);
+
+        if (yieldVal <= 0 || yieldVal >= 15) continue;
+
+        const dateStr = day + ' ' + month + ' ' + year;
+        const contextAround = pageText.slice(Math.max(0, match.index - 50), match.index + 100).toLowerCase();
+        const tenor = /1.year|1-year|364|one year/i.test(contextAround) ? '1-year' : '6-month';
+        const tenorDays = tenor === '1-year' ? 364 : 182;
+
+        auctions.push({
+          auction_date: dateStr,
+          tenor,
+          cutoff_yield: yieldVal.toFixed(2) + '%',
+          cutoff_price: calcCutoffPrice(yieldVal, tenorDays),
+          maturity_date: null,
+        });
+      }
+    }
+
+    // Deduplicate
+    const seen = new Set();
+    const unique = auctions.filter(a => {
+      const key = a.auction_date + '|' + a.tenor;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    console.log('Parsed', unique.length, 'auctions from Growbeansprout');
+
+    if (unique.length === 0) {
+      // If Growbeansprout page structure changed, fall back to MAS eServices
       return Response.json({
         success: false,
-        message: 'Could not parse auction data.',
-        rowCount: tableRows.length,
-        csvLength: csvData ? csvData.length : 0,
+        message: 'Could not parse from Growbeansprout. Page may have changed structure.',
+        pageTextPreview: pageText.slice(0, 500),
+        tableRows: tableRows.slice(0, 5),
       });
     }
 
-    const saved = await saveAuctions(supabase, auctions);
+    const saved = await saveAuctions(supabase, unique);
+
     return Response.json({
       success: true,
-      source: 'table',
-      scraped: auctions.length,
+      source: 'growbeansprout',
+      scraped: unique.length,
       saved,
-      sample: auctions.slice(-5),
+      sample: unique.slice(0, 5),
     });
 
   } catch (err) {
