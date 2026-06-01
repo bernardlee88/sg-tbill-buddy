@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 
 export default function AuctionsPage() {
   const [auctions, setAuctions] = useState([]);
+  const [upcoming, setUpcoming] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -18,11 +19,7 @@ export default function AuctionsPage() {
         setError('Could not load auction data. Please check mas.gov.sg directly.');
         setLoading(false);
       });
-  }, []);
 
-  const [upcoming, setUpcoming] = useState([]);
-
-  useEffect(() => {
     fetch('/api/mas?type=upcoming')
       .then(r => r.json())
       .then(data => {
@@ -36,7 +33,7 @@ export default function AuctionsPage() {
       <div className="page-header">
         <div className="page-header-inner">
           <h1>T-Bill Auctions</h1>
-          <p>Recent and upcoming Singapore T-Bill auctions sourced from MAS eServices.</p>
+          <p>Upcoming auction dates and recent results sourced from MAS.</p>
         </div>
       </div>
 
@@ -45,7 +42,7 @@ export default function AuctionsPage() {
 
           {/* Upcoming auctions */}
           {upcoming.length > 0 && (
-            <div style={{ marginBottom: '32px' }}>
+            <div style={{ marginBottom: '40px' }}>
               <div className="section-label">Coming Up</div>
               <h2 style={{ fontSize: '20px', fontWeight: '700', marginBottom: '16px', color: 'var(--gray-900)' }}>Upcoming Auctions</h2>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
@@ -65,7 +62,7 @@ export default function AuctionsPage() {
                 ))}
               </div>
               <p style={{ fontSize: '11px', color: 'var(--gray-400)', marginTop: '10px' }}>
-                Source: MAS 2026 Issuance Calendar. Application deadlines are for cash applications via internet banking. CPF/SRS deadlines may differ — check with your bank.
+                Source: MAS Issuance Calendar via ilovessb.com. Dates subject to revision by MAS. Cash application deadline is typically 9pm the day before auction — check with your bank for CPF/SRS deadlines.
               </p>
             </div>
           )}
@@ -84,19 +81,12 @@ export default function AuctionsPage() {
           {loading && (
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--gray-400)' }}>
               <div style={{ fontSize: '32px', marginBottom: '12px' }}>⏳</div>
-              Loading auction data from MAS...
+              Loading auction data...
             </div>
           )}
 
           {error && (
             <div className="disclaimer" style={{ marginBottom: '24px' }}>⚠️ {error}</div>
-          )}
-
-          {/* Last updated note */}
-          {!loading && auctions.length > 0 && auctions[0]?.lastUpdated && (
-            <div style={{ fontSize: '12px', color: 'var(--gray-400)', marginBottom: '16px' }}>
-              Data last updated: {auctions[0].lastUpdated} · Source: MAS Treasury Bills Statistics
-            </div>
           )}
 
           {!loading && auctions.length > 0 && (
@@ -121,10 +111,8 @@ export default function AuctionsPage() {
                     {auctions.map((auction, i) => (
                       <tr key={i}>
                         <td style={{ fontWeight: '500' }}>{auction.auctionDate}</td>
-                        <td><span className="badge badge-red">{auction.tenor || '6-month'}</span></td>
-                        <td style={{ fontWeight: '700', color: 'var(--red)' }}>
-                          {auction.cutoffYield || '—'}
-                        </td>
+                        <td><span className={auction.tenor === '1-year' ? 'badge badge-gold' : 'badge badge-red'}>{auction.tenor || '6-month'}</span></td>
+                        <td style={{ fontWeight: '700', color: 'var(--red)' }}>{auction.cutoffYield || '—'}</td>
                         <td>{auction.cutoffPrice || '—'}</td>
                         <td style={{ color: 'var(--gray-600)' }}>{auction.maturityDate || '—'}</td>
                         <td>
@@ -162,5 +150,42 @@ export default function AuctionsPage() {
                 {
                   step: '03',
                   title: 'Cut-off Yield',
-                  desc: 'The cut-off yield is determined by demand. Higher demand = lower yield. Lower demand = higher yield. Recent yields have been around 3-4% p.a.',
+                  desc: 'The cut-off yield is determined by demand. Higher demand = lower yield. Lower demand = higher yield.',
                 },
+                {
+                  step: '04',
+                  title: 'Application Deadline',
+                  desc: 'Apply by the closing date — typically 9pm the day before auction for cash applications. Results announced on auction day. Funds debited on issue date.',
+                },
+              ].map((item, i) => (
+                <div key={i} className="card" style={{ display: 'flex', gap: '16px' }}>
+                  <div style={{ fontFamily: 'Playfair Display, serif', fontSize: '32px', fontWeight: '900', color: 'var(--red)', opacity: 0.3, lineHeight: '1', flexShrink: 0 }}>{item.step}</div>
+                  <div>
+                    <div style={{ fontFamily: 'Playfair Display, serif', fontSize: '17px', fontWeight: '700', marginBottom: '8px' }}>{item.title}</div>
+                    <div style={{ fontSize: '14px', color: 'var(--gray-600)', lineHeight: '1.6' }}>{item.desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ marginTop: '32px' }} id="donate">
+            <div className="donate-bar">
+              <div>
+                <div className="donate-text" style={{ fontWeight: '600', marginBottom: '4px' }}>☕ Found this useful?</div>
+                <div className="donate-text">Help keep SG T-Bill Buddy free and up to date.</div>
+              </div>
+              <a href="https://ko-fi.com" target="_blank" rel="noopener" className="btn-donate">Support This Tool</a>
+            </div>
+          </div>
+
+          <div style={{ marginTop: '24px' }}>
+            <div className="disclaimer">
+              Auction data is sourced from MAS and ilovessb.com. While we strive for accuracy, always verify with the official MAS website before making investment decisions.
+            </div>
+          </div>
+        </div>
+      </section>
+    </>
+  );
+}
