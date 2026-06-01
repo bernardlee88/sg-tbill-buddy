@@ -1,4 +1,6 @@
 // app/api/scrape-mas/route.js
+// Scrapes latest 12 months of MAS T-Bill auction results using Browserless
+
 import { createClient } from '@supabase/supabase-js';
 
 function getSupabaseClient() {
@@ -75,28 +77,22 @@ export async function GET(request) {
 
   try {
     const supabase = getSupabaseClient();
+
+    // Calculate 12 months ago
     const now = new Date();
-    const currentYear = now.getFullYear().toString();
-    const currentMonth = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][now.getMonth()];
-    const startYear = (now.getFullYear() - 1).toString();
+    const twelveMonthsAgo = new Date(now);
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const startYear = twelveMonthsAgo.getFullYear().toString();
+    const startMonth = MONTHS[twelveMonthsAgo.getMonth()];
+    const endYear = now.getFullYear().toString();
+    const endMonth = MONTHS[now.getMonth()];
+
+    console.log('Scraping', startMonth, startYear, 'to', endMonth, endYear);
 
     const result = await browserlessRequest(`
       export default async function ({ page }) {
-        // Intercept XHR/fetch to capture UpdatePanel response
-        const ajaxResponses = [];
-        await page.setRequestInterception(true);
-        page.on('request', req => req.continue());
-        page.on('response', async res => {
-          const url = res.url();
-          const ct = res.headers()['content-type'] || '';
-          if (url.includes('fdanet') || ct.includes('text/plain') || ct.includes('text/html')) {
-            try {
-              const text = await res.text();
-              if (text.length > 100) ajaxResponses.push({ url, length: text.length, preview: text.slice(0, 200) });
-            } catch(e) {}
-          }
-        });
-
         await page.goto('https://eservices.mas.gov.sg/statistics/fdanet/BondTreasuryBillsCMTBsAuctions.aspx', {
           waitUntil: 'networkidle2',
           timeout: 30000,
@@ -126,14 +122,14 @@ export async function GET(request) {
         await page.click('#ContentPlaceHolder1_TBillsAndCMTBsCheckBoxList_0');
         await new Promise(r => setTimeout(r, 300));
 
-        // Set date range
+        // Set date range — last 12 months
         await page.select('#ContentPlaceHolder1_StartYearDropDownList', '${startYear}');
-        await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${currentYear}');
-        await page.select('#ContentPlaceHolder1_StartMonthDropDownList', 'Jan');
-        await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${currentMonth}');
+        await page.select('#ContentPlaceHolder1_EndYearDropDownList', '${endYear}');
+        await page.select('#ContentPlaceHolder1_StartMonthDropDownList', '${startMonth}');
+        await page.select('#ContentPlaceHolder1_EndMonthDropDownList', '${endMonth}');
         try { await page.select('#ContentPlaceHolder1_TermToMaturityAtAuctionTBillsDropDownList', 'All'); } catch(e) {}
 
-        // Uncheck all column checkboxes then check needed ones
+        // Select columns: Term(3), Issue Date(6), Maturity Date(7), Cut-off Yield(11), Cut-off Price(12)
         for (let i = 0; i <= 16; i++) {
           const el = await page.$('#ContentPlaceHolder1_SelectedColumnsCheckBoxList_' + i);
           if (el) {
@@ -148,26 +144,19 @@ export async function GET(request) {
         }
 
         // Click Display
-        await page.click('#ContentPlaceHolder1_DisplayButton');
+        await page.evaluate(() => {
+          document.getElementById('ContentPlaceHolder1_DisplayButton').click();
+        });
 
-        // Wait for table to appear in DOM — up to 15 seconds
+        // Wait for table to appear
         try {
           await page.waitForFunction(
-            () => {
-              const tables = document.querySelectorAll('table');
-              for (const t of tables) {
-                const rows = t.querySelectorAll('tr');
-                if (rows.length > 3) return true;
-              }
-              return false;
-            },
+            () => Array.from(document.querySelectorAll('table')).some(t => t.querySelectorAll('tr').length > 3),
             { timeout: 15000 }
           );
-        } catch(e) {
-          console.log('waitForFunction timed out — extracting anyway');
-        }
+        } catch(e) { console.log('waitForFunction timed out'); }
 
-        // Extract table data
+        // Extract table
         const tableData = await page.evaluate(() => {
           const results = [];
           document.querySelectorAll('table').forEach((table, tIdx) => {
@@ -179,20 +168,15 @@ export async function GET(request) {
           return results;
         });
 
-        const pageText = await page.evaluate(() => document.body.innerText.slice(800, 3000));
-
-        return { tableData, pageText, ajaxResponses: ajaxResponses.slice(0, 5) };
+        return { tableData };
       }
     `);
 
     const rows = result?.tableData || [];
-    const pageText = result?.pageText || '';
-    const ajaxResponses = result?.ajaxResponses || [];
-    console.log('Rows:', rows.length, 'AJAX responses:', ajaxResponses.length);
+    console.log('Got', rows.length, 'rows');
 
     // Parse rows
-    // Data format from MAS: [Term(days), Unit, IssueDate(DD/MM/YYYY), MaturityDate, Yield, Price]
-    // Header row has newlines e.g. "Cut-off\nYield (%)"
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     const auctions = [];
     let headerFound = false;
     let colMap = {};
@@ -200,11 +184,8 @@ export async function GET(request) {
     for (const row of rows) {
       const cells = row.cells || [];
       if (cells.length < 2) continue;
-
-      // Normalise cells — remove newlines for header matching
       const normCells = cells.map(c => c.replace(/\n/g, ' ').trim());
 
-      // Detect header row
       if (!headerFound && normCells.some(c => /cut.off yield|issue.?date/i.test(c))) {
         headerFound = true;
         normCells.forEach((c, i) => {
@@ -215,18 +196,12 @@ export async function GET(request) {
           if (/cut.off price/.test(norm)) colMap.price = i;
           if (/term|tenor/.test(norm)) colMap.term = i;
         });
-        console.log('colMap:', JSON.stringify(colMap));
         continue;
       }
 
       if (!headerFound) continue;
-
-      // Skip rows that are clearly not data
       if (normCells[0] === 'Bond Auction Results') continue;
 
-      // Extract fields using column map
-      // From sample: ["182","Day","07/01/2025","08/07/2025","3.05","98.479"]
-      // colMap based on header: term=0, issueDate=2, maturityDate=3, yield=4, price=5
       const issueDate = colMap.issueDate !== undefined ? normCells[colMap.issueDate] : normCells.find(c => /\d{2}\/\d{2}\/\d{4}/.test(c));
       const maturityDate = colMap.maturityDate !== undefined ? normCells[colMap.maturityDate] : null;
       const yieldVal = colMap.yield !== undefined ? normCells[colMap.yield] : normCells.find(c => /^\d+\.\d{2,4}$/.test(c) && parseFloat(c) < 15 && parseFloat(c) > 0);
@@ -236,18 +211,15 @@ export async function GET(request) {
       if (!issueDate || !yieldVal) continue;
       if (!/\d{2}\/\d{2}\/\d{4}/.test(issueDate)) continue;
 
-      // Convert DD/MM/YYYY to readable format
       const [day, month, year] = issueDate.split('/');
-      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      const formattedDate = day + ' ' + months[parseInt(month) - 1] + ' ' + year;
+      const formattedDate = day + ' ' + MONTH_NAMES[parseInt(month) - 1] + ' ' + year;
 
       let formattedMaturity = null;
       if (maturityDate && /\d{2}\/\d{2}\/\d{4}/.test(maturityDate)) {
         const [md, mm, my] = maturityDate.split('/');
-        formattedMaturity = md + ' ' + months[parseInt(mm) - 1] + ' ' + my;
+        formattedMaturity = md + ' ' + MONTH_NAMES[parseInt(mm) - 1] + ' ' + my;
       }
 
-      // Determine tenor from term days
       const days = parseInt(termDays) || 0;
       const tenor = days >= 350 ? '1-year' : '6-month';
 
@@ -260,15 +232,14 @@ export async function GET(request) {
       });
     }
 
+    console.log('Parsed', auctions.length, 'auctions');
+
     if (auctions.length === 0) {
       return Response.json({
         success: false,
         message: 'Could not parse auction data.',
         rowCount: rows.length,
-        sampleRows: rows.slice(0, 20),
-        pageTextPreview: pageText,
-        colMap,
-        ajaxResponses,
+        sampleRows: rows.slice(0, 10),
       });
     }
 
@@ -278,7 +249,8 @@ export async function GET(request) {
       success: true,
       scraped: auctions.length,
       saved,
-      sample: auctions.slice(0, 5),
+      range: startMonth + ' ' + startYear + ' to ' + endMonth + ' ' + endYear,
+      sample: auctions.slice(0, 3),
     });
 
   } catch (err) {
