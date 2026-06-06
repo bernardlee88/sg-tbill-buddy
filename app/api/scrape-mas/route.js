@@ -1,7 +1,7 @@
 // app/api/scrape-mas/route.js
 // Scrapes T-bill auction data from ilovessb.com
-// Source has accurate upcoming dates + cut-off yields from MAS
-// Cron: every Thursday at 6pm SGT (10:00 UTC) + every Monday to catch new upcoming dates
+// Page returns server-rendered markdown tables — no JS rendering needed
+// Cron: every Thursday 6pm SGT (10:00 UTC) + every Monday 10am SGT (02:00 UTC)
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -26,60 +26,54 @@ function calcCutoffPrice(yieldPct, tenorDays) {
   return (100 - 100 * y * t / 365).toFixed(3);
 }
 
-// Convert "04 Jun 2026" format dates from ilovessb
 function normaliseDate(dateStr) {
   if (!dateStr) return null;
-  const s = dateStr.trim();
-  // Already in "DD Mon YYYY" format
-  if (/^\d{1,2}\s+\w{3}\s+\d{4}$/.test(s)) {
-    const parts = s.split(/\s+/);
-    return parts[0].padStart(2, '0') + ' ' + parts[1] + ' ' + parts[2];
-  }
-  return s;
+  const parts = dateStr.trim().split(/\s+/);
+  if (parts.length !== 3) return null;
+  return parts[0].padStart(2, '0') + ' ' + parts[1] + ' ' + parts[2];
 }
 
-async function saveAuctions(supabase, auctions) {
+// Parse a markdown table section for T-bills
+// Row format: | Announcement | Auction | Issue | Maturity | Code | Status | Yield | Price |
+function parseMarkdownTable(text, tenor) {
+  const results = [];
+  const tenorDays = tenor === '1-year' ? 364 : 182;
+  const lines = text.split('\n');
+
+  for (const line of lines) {
+    if (!line.includes('|')) continue;
+    const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+    if (cells.length < 6) continue;
+
+    // Must have a valid date in column 1 (auction date)
+    if (!/^\d{1,2}\s+\w{3}\s+\d{4}$/.test(cells[1])) continue;
+
+    const yieldVal = cells[6] || '';
+    const price = cells[7] || '';
+    const status = (cells[5] || '').toLowerCase();
+
+    results.push({
+      auction_date: normaliseDate(cells[1]),
+      issue_date: normaliseDate(cells[2]),
+      maturity_date: normaliseDate(cells[3]),
+      tenor,
+      code: (cells[4] || '').trim(),
+      status,
+      cutoff_yield: yieldVal ? parseFloat(yieldVal).toFixed(2) + '%' : null,
+      cutoff_price: price || (yieldVal ? calcCutoffPrice(yieldVal, tenorDays) : null),
+    });
+  }
+  return results;
+}
+
+async function saveToSupabase(supabase, table, records, conflictCol) {
   let saved = 0;
-  for (const auction of auctions) {
+  for (const record of records) {
     const { error } = await supabase
-      .from('tbill_auctions')
-      .upsert(
-        {
-          auction_date: auction.auction_date,
-          tenor: auction.tenor,
-          cutoff_yield: auction.cutoff_yield || null,
-          cutoff_price: auction.cutoff_price || null,
-          maturity_date: auction.maturity_date || null,
-          scraped_at: new Date().toISOString(),
-        },
-        { onConflict: 'auction_date,tenor' }
-      );
+      .from(table)
+      .upsert(record, { onConflict: conflictCol });
     if (!error) saved++;
     else console.error('Upsert error:', error.message);
-  }
-  return saved;
-}
-
-async function saveUpcoming(supabase, upcoming) {
-  // Store upcoming auctions in a separate table
-  let saved = 0;
-  for (const item of upcoming) {
-    const { error } = await supabase
-      .from('tbill_upcoming')
-      .upsert(
-        {
-          auction_date: item.auction_date,
-          issue_date: item.issue_date,
-          maturity_date: item.maturity_date,
-          tenor: item.tenor,
-          code: item.code,
-          status: item.status,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'auction_date,tenor' }
-      );
-    if (!error) saved++;
-    else console.error('Upcoming upsert error:', error.message);
   }
   return saved;
 }
@@ -89,14 +83,12 @@ export async function GET(request) {
     return Response.json({ error: 'Unauthorised' }, { status: 401 });
   }
 
-  const params = new URL(request.url).searchParams;
-
-  if (params.get('debug') === '1') {
+  if (new URL(request.url).searchParams.get('debug') === '1') {
     return Response.json({
       env: {
-        BROWSERLESS_API_KEY: process.env.BROWSERLESS_API_KEY ? 'set' : 'MISSING',
         SUPABASE_URL: process.env.SUPABASE_URL ? 'set' : 'MISSING',
         SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING',
+        CRON_SECRET: process.env.CRON_SECRET ? 'set' : 'MISSING',
       }
     });
   }
@@ -104,109 +96,90 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Use Browserless /scrape to extract table rows directly via CSS selectors
-    const apiKey = process.env.BROWSERLESS_API_KEY;
-    if (!apiKey) throw new Error('Missing BROWSERLESS_API_KEY');
+    // Fetch ilovessb.com with a browser-like User-Agent to avoid bot blocks
+    const res = await fetch('https://www.ilovessb.com/sgs', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-SG,en;q=0.9',
+      },
+    });
 
-    const scrapeRes = await fetch(
-      'https://production-sfo.browserless.io/scrape?token=' + apiKey,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: 'https://www.ilovessb.com/sgs',
-          elements: [{ selector: 'table tr' }],
-          gotoOptions: { waitUntil: 'networkidle2' },
-        }),
-      }
-    );
+    if (!res.ok) throw new Error('Fetch error: ' + res.status);
+    const html = await res.text();
 
-    if (!scrapeRes.ok) throw new Error('Browserless scrape error: ' + scrapeRes.status);
+    // Convert HTML to plain text for markdown parsing
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/\r/g, '');
 
-    const scrapeData = await scrapeRes.json();
-    const rows = scrapeData?.data?.[0]?.results || [];
+    // Extract 6-month and 1-year sections
+    const sixMonthStart = text.indexOf('6-Month T-bill');
+    const oneYearStart = text.indexOf('1-Year T-bill');
+    const twoYearStart = text.indexOf('2-Year SGS');
 
-    // Build a pseudo-HTML string from scraped rows for our parser
-    const html = rows.map(r => '<tr>' + r.html + '</tr>').join('\n');
-
-    // Parse scraped rows — detect tenor by looking for section headers nearby
-    function parseRows(rowsHtml, allRowHtmls) {
-      const results = [];
-      let currentTenor = '6-month';
-
-      for (const rowHtml of allRowHtmls) {
-        const text = rowHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-
-        // Detect section headers
-        if (/6-Month T-bill/i.test(text)) { currentTenor = '6-month'; continue; }
-        if (/1-Year T-bill/i.test(text)) { currentTenor = '1-year'; continue; }
-        if (/2-Year SGS|5-Year SGS|10-Year/i.test(text)) break; // stop at bond sections
-
-        // Extract cells
-        const cells = [];
-        const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-        let m;
-        while ((m = tdRegex.exec(rowHtml)) !== null) {
-          cells.push(m[1].replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim());
-        }
-
-        if (cells.length < 6) continue;
-        if (!/^\d{1,2}\s+\w{3}\s+\d{4}$/.test(cells[1])) continue; // auction date in col 1
-
-        const yieldVal = cells[6] || '';
-        const price = cells[7] || '';
-        const tenorDays = currentTenor === '1-year' ? 364 : 182;
-
-        results.push({
-          auction_date: normaliseDate(cells[1]),
-          issue_date: normaliseDate(cells[2]),
-          maturity_date: normaliseDate(cells[3]),
-          tenor: currentTenor,
-          code: (cells[4] || '').trim(),
-          status: (cells[5] || '').trim().toLowerCase(),
-          cutoff_yield: yieldVal ? yieldVal + '%' : null,
-          cutoff_price: price || (yieldVal ? calcCutoffPrice(yieldVal, tenorDays) : null),
-        });
-      }
-      return results;
-    }
-
-    const allRowHtmls = rows.map(r => r.html || '');
-    const allData = parseRows(html, allRowHtmls);
-
-    console.log('Parsed', allData.length, 'entries from ilovessb');
-
-    if (allData.length === 0) {
-      // Check if tables exist in the HTML at all
+    if (sixMonthStart === -1) {
       return Response.json({
         success: false,
-        message: 'Could not parse ilovessb data',
-        rowCount: rows.length,
-        sampleRow: rows[0]?.html?.slice(0, 200) || 'no rows',
+        message: 'Could not find 6-Month T-bill section',
+        textPreview: text.slice(0, 300),
       });
     }
 
-    // Split into closed (have yield) and upcoming (no yield)
-    const closed = allData.filter(a => a.cutoff_yield && a.status === 'closed');
-    const upcoming = allData.filter(a => a.status !== 'closed');
+    const sixMonthText = text.slice(sixMonthStart, oneYearStart > sixMonthStart ? oneYearStart : sixMonthStart + 2000);
+    const oneYearText = oneYearStart > 0 ? text.slice(oneYearStart, twoYearStart > oneYearStart ? twoYearStart : oneYearStart + 1000) : '';
 
-    console.log('Closed:', closed.length, 'Upcoming:', upcoming.length);
+    const sixMonthData = parseMarkdownTable(sixMonthText, '6-month');
+    const oneYearData = parseMarkdownTable(oneYearText, '1-year');
+    const allData = [...sixMonthData, ...oneYearData];
+
+    if (allData.length === 0) {
+      return Response.json({
+        success: false,
+        message: 'Could not parse any rows',
+        sixMonthPreview: sixMonthText.slice(0, 300),
+      });
+    }
+
+    // Split into closed (with yield) and upcoming
+    const closed = allData.filter(a => a.cutoff_yield && a.status === 'closed');
+    const upcoming = allData.filter(a => a.status === 'upcoming');
 
     // Save closed auctions to tbill_auctions
-    const savedAuctions = closed.length > 0 ? await saveAuctions(supabase, closed) : 0;
+    const savedAuctions = closed.length > 0
+      ? await saveToSupabase(supabase, 'tbill_auctions', closed.map(a => ({
+          auction_date: a.auction_date,
+          tenor: a.tenor,
+          cutoff_yield: a.cutoff_yield,
+          cutoff_price: a.cutoff_price,
+          maturity_date: a.maturity_date,
+          scraped_at: new Date().toISOString(),
+        })), 'auction_date,tenor')
+      : 0;
 
     // Save upcoming to tbill_upcoming
-    const savedUpcoming = upcoming.length > 0 ? await saveUpcoming(supabase, upcoming) : 0;
+    const savedUpcoming = upcoming.length > 0
+      ? await saveToSupabase(supabase, 'tbill_upcoming', upcoming.map(a => ({
+          auction_date: a.auction_date,
+          issue_date: a.issue_date,
+          maturity_date: a.maturity_date,
+          tenor: a.tenor,
+          code: a.code,
+          status: a.status,
+          updated_at: new Date().toISOString(),
+        })), 'auction_date,tenor')
+      : 0;
 
     return Response.json({
       success: true,
       source: 'ilovessb.com',
-      closedAuctions: { found: closed.length, saved: savedAuctions },
-      upcomingAuctions: { found: upcoming.length, saved: savedUpcoming },
-      sample: {
-        closed: closed.slice(0, 3),
-        upcoming: upcoming.slice(0, 3),
-      },
+      closed: { found: closed.length, saved: savedAuctions },
+      upcoming: { found: upcoming.length, saved: savedUpcoming },
+      sample: { closed: closed.slice(0, 2), upcoming: upcoming.slice(0, 2) },
     });
 
   } catch (err) {
