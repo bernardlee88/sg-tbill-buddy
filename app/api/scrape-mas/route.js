@@ -1,7 +1,5 @@
 // app/api/scrape-mas/route.js
-// Fetches T-bill data from ilovessb.com individual T-bill pages
-// These pages are server-rendered and fetchable without Browserless
-// Strategy: fetch nav first to get latest codes, then fetch each T-bill page
+// Scrapes T-bill data from ilovessb.com individual T-bill pages
 // Cron: every Thursday 6pm SGT (10:00 UTC) + every Monday 10am SGT (02:00 UTC)
 
 import { createClient } from '@supabase/supabase-js';
@@ -34,6 +32,10 @@ function normaliseDate(raw) {
   return parts[0].padStart(2, '0') + ' ' + parts[1] + ' ' + parts[2];
 }
 
+function stripTags(html) {
+  return html.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+}
+
 const FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml',
@@ -46,61 +48,48 @@ async function fetchPage(url) {
   return res.text();
 }
 
-// Parse upcoming auctions table from ilovessb T-bill page
-// Table format: | Announcement | Auction | Issue | Maturity | Code | ISIN |
-function parseUpcomingTable(markdown, tenor) {
-  const results = [];
-  const lines = markdown.split('\n');
-  let inUpcoming = false;
-
-  for (const line of lines) {
-    if (/## Upcoming Auctions/i.test(line)) { inUpcoming = true; continue; }
-    if (inUpcoming && /^##\s/.test(line)) break; // next section
-
-    if (!inUpcoming || !line.includes('|')) continue;
-    const cells = line.split('|').map(c => c.trim()).filter(Boolean);
-    if (cells.length < 4) continue;
-    if (!/^\d{1,2}\s+\w{3}\s+\d{4}$/.test(cells[0])) continue; // skip header/separator
-
-    results.push({
-      auction_date: normaliseDate(cells[1]),
-      issue_date: normaliseDate(cells[2]),
-      maturity_date: normaliseDate(cells[3]),
-      tenor,
-      code: cells[4] || '',
-      status: 'upcoming',
-      updated_at: new Date().toISOString(),
-    });
+// Parse HTML tables from a page — returns array of row arrays
+function parseHtmlTables(html) {
+  const tables = [];
+  const tableRegex = /<table[\s\S]*?<\/table>/gi;
+  let tableMatch;
+  while ((tableMatch = tableRegex.exec(html)) !== null) {
+    const rows = [];
+    const trRegex = /<tr[\s\S]*?<\/tr>/gi;
+    let trMatch;
+    while ((trMatch = trRegex.exec(tableMatch[0])) !== null) {
+      const cells = [];
+      const tdRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+      let tdMatch;
+      while ((tdMatch = tdRegex.exec(trMatch[0])) !== null) {
+        cells.push(stripTags(tdMatch[1]).replace(/\s+/g, ' ').trim());
+      }
+      if (cells.length > 0) rows.push(cells);
+    }
+    if (rows.length > 0) tables.push(rows);
   }
-  return results;
+  return tables;
 }
 
-// Parse cut-off yield and auction details from a closed T-bill page
-function parseClosedAuction(markdown, tenor) {
-  // Extract auction date from title e.g. "# 6-Month T-bill BS26110S (21 May 2026)"
-  const titleMatch = markdown.match(/# (?:6-Month|1-Year) T-bill \w+ \((\d{1,2} \w{3} \d{4})\)/);
-  const auctionDate = titleMatch ? normaliseDate(titleMatch[1]) : null;
+// Extract cut-off yield from page text
+function extractCutoffYield(html) {
+  const text = stripTags(html).replace(/\s+/g, ' ');
+  const match = text.match(/Cut-Off Yield\s+([\d.]+)%/) ||
+                text.match(/cut.off yield.*?([\d.]+)%/i);
+  return match ? parseFloat(match[1]) : null;
+}
 
-  // Extract maturity date
-  const maturityMatch = markdown.match(/Maturity Date\s*\n(\d{1,2} \w{3} \d{4})/);
-  const maturityDate = maturityMatch ? normaliseDate(maturityMatch[1]) : null;
+// Extract auction date from page title
+function extractAuctionDate(html) {
+  const match = html.match(/(\d{1,2}\s+\w{3}\s+\d{4})\)\s*(?:Cut-Off|Closed|Upcoming|Closing)/i) ||
+                html.match(/<title>[^(]+\((\d{1,2}\s+\w{3}\s+\d{4})\)/i);
+  return match ? normaliseDate(match[1]) : null;
+}
 
-  // Extract cut-off yield from statistics table
-  // "| Auction Date | Issue Code | Cut-Off Yield (%) |" followed by data rows
-  const yieldMatch = markdown.match(/Cut-Off Yield \(%\)[^\n]*\n[^\n]*\n\|\s*[\d ]+\w{3} \d{4}\s*\|\s*\w+\s*\|\s*([\d.]+)/);
-  const cutoffYield = yieldMatch ? yieldMatch[1] : null;
-
-  if (!auctionDate || !cutoffYield) return null;
-
-  const tenorDays = tenor === '1-year' ? 364 : 182;
-  return {
-    auction_date: auctionDate,
-    tenor,
-    cutoff_yield: parseFloat(cutoffYield).toFixed(2) + '%',
-    cutoff_price: calcCutoffPrice(cutoffYield, tenorDays),
-    maturity_date: maturityDate,
-    scraped_at: new Date().toISOString(),
-  };
+// Extract maturity date from auction details section
+function extractMaturityDate(html) {
+  const match = html.match(/Maturity Date[\s\S]{0,50}?(\d{1,2}\s+\w{3}\s+\d{4})/i);
+  return match ? normaliseDate(match[1]) : null;
 }
 
 async function upsertRecords(supabase, table, records, conflictCol) {
@@ -108,7 +97,7 @@ async function upsertRecords(supabase, table, records, conflictCol) {
   for (const record of records) {
     const { error } = await supabase.from(table).upsert(record, { onConflict: conflictCol });
     if (!error) saved++;
-    else console.error('Upsert error on', table, ':', error.message);
+    else console.error('Upsert error:', error.message);
   }
   return saved;
 }
@@ -131,68 +120,77 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Step 1 — Use known current T-bill page URLs
-    // Update these when a new auction opens (every ~2 weeks for 6-month, quarterly for 1-year)
-    // URL format: /[tenor]-tbill/[CODE]-[DD]-[Mon]-[YYYY]
     const baseUrl = 'https://www.ilovessb.com';
-    const sixMonthUrl = '/6-month-tbill/BS26111H-04-Jun-2026';
-    const oneYearUrl = '/1-year-tbill/BY26101H-16-Apr-2026';
-    const results = { upcoming: [], closed: [] };
 
-    // Step 2 — Fetch 6-month T-bill page and convert to plain text
-    const sixMonthHtml = await fetchPage(baseUrl + sixMonthUrl);
-    const sixMonthMarkdown = sixMonthHtml
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/\s{2,}/g, ' ')
-      .replace(/ \n/g, '\n');
-    const sixMonthUpcoming = parseUpcomingTable(sixMonthMarkdown, '6-month');
-    results.upcoming.push(...sixMonthUpcoming);
+    // Known current T-bill page URLs — update these when a new auction opens
+    // 6-month: every ~2 weeks | 1-year: quarterly
+    const TBILL_PAGES = [
+      { url: baseUrl + '/6-month-tbill/BS26111H-04-Jun-2026', tenor: '6-month' },
+      { url: baseUrl + '/1-year-tbill/BY26101H-16-Apr-2026', tenor: '1-year' },
+    ];
 
-    // Check if this page is for a closed auction — parse yield
-    const sixMonthClosed = parseClosedAuction(sixMonthMarkdown, '6-month');
-    if (sixMonthClosed) results.closed.push(sixMonthClosed);
+    const closed = [];
+    const upcoming = [];
 
-    // Step 3 — Fetch 1-year T-bill page
-    if (oneYearUrl) {
-      const oneYearHtml = await fetchPage(baseUrl + oneYearUrl);
-      const oneYearMarkdown = oneYearHtml
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/\s{2,}/g, ' ')
-        .replace(/ \n/g, '\n');
-      const oneYearUpcoming = parseUpcomingTable(oneYearMarkdown, '1-year');
-      results.upcoming.push(...oneYearUpcoming);
+    for (const { url, tenor } of TBILL_PAGES) {
+      const html = await fetchPage(url);
+      const tenorDays = tenor === '1-year' ? 364 : 182;
 
-      const oneYearClosed = parseClosedAuction(oneYearMarkdown, '1-year');
-      if (oneYearClosed) results.closed.push(oneYearClosed);
+      // Extract closed auction data
+      const auctionDate = extractAuctionDate(html);
+      const cutoffYield = extractCutoffYield(html);
+      const maturityDate = extractMaturityDate(html);
+
+      if (auctionDate && cutoffYield) {
+        closed.push({
+          auction_date: auctionDate,
+          tenor,
+          cutoff_yield: cutoffYield.toFixed(2) + '%',
+          cutoff_price: calcCutoffPrice(cutoffYield, tenorDays),
+          maturity_date: maturityDate,
+          scraped_at: new Date().toISOString(),
+        });
+      }
+
+      // Extract upcoming auctions from tables
+      const tables = parseHtmlTables(html);
+      const dateRe = /^\d{1,2}\s+\w{3}\s+\d{4}$/;
+
+      for (const table of tables) {
+        for (const row of table) {
+          // Upcoming table columns: Announcement | Auction | Issue | Maturity | Code | ISIN
+          if (row.length < 4) continue;
+          if (!dateRe.test(row[0]) || !dateRe.test(row[1])) continue;
+
+          // Skip if this looks like a yield statistics table
+          if (/^\d+\.\d+$/.test(row[2])) continue;
+
+          upcoming.push({
+            auction_date: normaliseDate(row[1]),
+            issue_date: normaliseDate(row[2]),
+            maturity_date: normaliseDate(row[3]),
+            tenor,
+            code: row[4] || '',
+            status: 'upcoming',
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
     }
 
-    // Step 4 — Save to Supabase
-    const savedAuctions = results.closed.length > 0
-      ? await upsertRecords(supabase, 'tbill_auctions', results.closed, 'auction_date,tenor')
+    const savedAuctions = closed.length > 0
+      ? await upsertRecords(supabase, 'tbill_auctions', closed, 'auction_date,tenor')
       : 0;
 
-    const savedUpcoming = results.upcoming.length > 0
-      ? await upsertRecords(supabase, 'tbill_upcoming', results.upcoming, 'auction_date,tenor')
+    const savedUpcoming = upcoming.length > 0
+      ? await upsertRecords(supabase, 'tbill_upcoming', upcoming, 'auction_date,tenor')
       : 0;
 
     return Response.json({
       success: true,
       source: 'ilovessb.com',
-      debug: {
-        sixMonthTextPreview: sixMonthMarkdown.slice(0, 500),
-        hasUpcomingSection: sixMonthMarkdown.includes('Upcoming Auctions'),
-        sixMonthUpcomingCount: sixMonthUpcoming.length,
-      },
-      closed: { found: results.closed.length, saved: savedAuctions, data: results.closed },
-      upcoming: { found: results.upcoming.length, saved: savedUpcoming, data: results.upcoming.slice(0, 3) },
+      closed: { found: closed.length, saved: savedAuctions, data: closed },
+      upcoming: { found: upcoming.length, saved: savedUpcoming, sample: upcoming.slice(0, 3) },
     });
 
   } catch (err) {
