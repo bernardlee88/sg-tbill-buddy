@@ -178,17 +178,11 @@ export async function GET(request) {
 
     if (allData.length === 0) {
       // Check if tables exist in the HTML at all
-      const tableCount = (html.match(/<table/g) || []).length;
-      const tdCount = (html.match(/<td/g) || []).length;
-      const sixMonthFound = html.includes('6-Month T-bill');
       return Response.json({
         success: false,
         message: 'Could not parse ilovessb data',
-        tableCount,
-        tdCount,
-        sixMonthFound,
-        sixMonthSectionPreview: sixMonthSection.slice(0, 300),
-        htmlLength: html.length,
+        rowCount: rows.length,
+        sampleRow: rows[0]?.html?.slice(0, 200) || 'no rows',
       });
     }
 
