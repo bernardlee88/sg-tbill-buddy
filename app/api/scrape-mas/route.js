@@ -104,53 +104,64 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // ilovessb.com blocks Vercel IPs — use Browserless to fetch with real browser fingerprint
+    // Use Browserless /scrape to extract table rows directly via CSS selectors
     const apiKey = process.env.BROWSERLESS_API_KEY;
     if (!apiKey) throw new Error('Missing BROWSERLESS_API_KEY');
 
-    const res = await fetch(
-      'https://chrome.browserless.io/content?token=' + apiKey,
+    const scrapeRes = await fetch(
+      'https://production-sfo.browserless.io/scrape?token=' + apiKey,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: 'https://www.ilovessb.com/sgs', waitFor: 3000 }),
+        body: JSON.stringify({
+          url: 'https://www.ilovessb.com/sgs',
+          elements: [{ selector: 'table tr' }],
+          gotoOptions: { waitUntil: 'networkidle2' },
+        }),
       }
     );
 
-    if (!res.ok) throw new Error('Browserless fetch error: ' + res.status);
+    if (!scrapeRes.ok) throw new Error('Browserless scrape error: ' + scrapeRes.status);
 
-    const html = await res.text();
+    const scrapeData = await scrapeRes.json();
+    const rows = scrapeData?.data?.[0]?.results || [];
 
-    // Parse HTML tables from ilovessb.com
-    function parseTbillSection(htmlStr, tenor) {
+    // Build a pseudo-HTML string from scraped rows for our parser
+    const html = rows.map(r => '<tr>' + r.html + '</tr>').join('\n');
+
+    // Parse scraped rows — detect tenor by looking for section headers nearby
+    function parseRows(rowsHtml, allRowHtmls) {
       const results = [];
-      const tenorDays = tenor === '1-year' ? 364 : 182;
-      const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-      let trMatch;
-      while ((trMatch = trRegex.exec(htmlStr)) !== null) {
-        const rowHtml = trMatch[1];
+      let currentTenor = '6-month';
+
+      for (const rowHtml of allRowHtmls) {
+        const text = rowHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+        // Detect section headers
+        if (/6-Month T-bill/i.test(text)) { currentTenor = '6-month'; continue; }
+        if (/1-Year T-bill/i.test(text)) { currentTenor = '1-year'; continue; }
+        if (/2-Year SGS|5-Year SGS|10-Year/i.test(text)) break; // stop at bond sections
+
+        // Extract cells
         const cells = [];
         const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-        let tdMatch;
-        while ((tdMatch = tdRegex.exec(rowHtml)) !== null) {
-          const text = tdMatch[1]
-            .replace(/<[^>]*>/g, '')
-            .replace(/&amp;/g, '&')
-            .replace(/&nbsp;/g, ' ')
-            .trim();
-          cells.push(text);
+        let m;
+        while ((m = tdRegex.exec(rowHtml)) !== null) {
+          cells.push(m[1].replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim());
         }
+
         if (cells.length < 6) continue;
-        // Columns: Announcement, Auction, Issue, Maturity, Code, Status, Yield, Price
-        const dateRe = /^\d{1,2}\s+\w{3}\s+\d{4}$/;
-        if (!dateRe.test(cells[1])) continue; // auction date in col 1
+        if (!/^\d{1,2}\s+\w{3}\s+\d{4}$/.test(cells[1])) continue; // auction date in col 1
+
         const yieldVal = cells[6] || '';
         const price = cells[7] || '';
+        const tenorDays = currentTenor === '1-year' ? 364 : 182;
+
         results.push({
           auction_date: normaliseDate(cells[1]),
           issue_date: normaliseDate(cells[2]),
           maturity_date: normaliseDate(cells[3]),
-          tenor,
+          tenor: currentTenor,
           code: (cells[4] || '').trim(),
           status: (cells[5] || '').trim().toLowerCase(),
           cutoff_yield: yieldVal ? yieldVal + '%' : null,
@@ -160,17 +171,8 @@ export async function GET(request) {
       return results;
     }
 
-    const sixMonthIdx = html.indexOf('6-Month T-bill');
-    const oneYearIdx = html.indexOf('1-Year T-bill');
-    const twoYearIdx = html.indexOf('2-Year SGS');
-
-    const sixMonthSection = sixMonthIdx >= 0 ? html.slice(sixMonthIdx, oneYearIdx > sixMonthIdx ? oneYearIdx : sixMonthIdx + 5000) : '';
-    const oneYearSection = oneYearIdx >= 0 ? html.slice(oneYearIdx, twoYearIdx > oneYearIdx ? twoYearIdx : oneYearIdx + 3000) : '';
-
-    const allData = [
-      ...parseTbillSection(sixMonthSection, '6-month'),
-      ...parseTbillSection(oneYearSection, '1-year'),
-    ];
+    const allRowHtmls = rows.map(r => r.html || '');
+    const allData = parseRows(html, allRowHtmls);
 
     console.log('Parsed', allData.length, 'entries from ilovessb');
 
