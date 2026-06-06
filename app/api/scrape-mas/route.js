@@ -131,18 +131,24 @@ export async function GET(request) {
   try {
     const supabase = getSupabaseClient();
 
-    // Step 1 — Fetch nav page to extract latest T-bill page URLs
-    const navHtml = await fetchPage('https://www.ilovessb.com/sgs');
-    const sixMonthUrl = navHtml.match(/href="(\/6-month-tbill\/[^"]+)"/)?.[1];
-    const oneYearUrl = navHtml.match(/href="(\/1-year-tbill\/[^"]+)"/)?.[1];
-
-    if (!sixMonthUrl) throw new Error('Could not find 6-month T-bill URL in nav');
-
+    // Step 1 — Use known current T-bill page URLs
+    // Update these when a new auction opens (every ~2 weeks for 6-month, quarterly for 1-year)
+    // URL format: /[tenor]-tbill/[CODE]-[DD]-[Mon]-[YYYY]
     const baseUrl = 'https://www.ilovessb.com';
+    const sixMonthUrl = '/6-month-tbill/BS26111H-04-Jun-2026';
+    const oneYearUrl = '/1-year-tbill/BY26101H-16-Apr-2026';
     const results = { upcoming: [], closed: [] };
 
-    // Step 2 — Fetch 6-month T-bill page
-    const sixMonthMarkdown = await fetchPage(baseUrl + sixMonthUrl);
+    // Step 2 — Fetch 6-month T-bill page and convert to plain text
+    const sixMonthHtml = await fetchPage(baseUrl + sixMonthUrl);
+    const sixMonthMarkdown = sixMonthHtml
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/ \n/g, '\n');
     const sixMonthUpcoming = parseUpcomingTable(sixMonthMarkdown, '6-month');
     results.upcoming.push(...sixMonthUpcoming);
 
@@ -152,7 +158,15 @@ export async function GET(request) {
 
     // Step 3 — Fetch 1-year T-bill page
     if (oneYearUrl) {
-      const oneYearMarkdown = await fetchPage(baseUrl + oneYearUrl);
+      const oneYearHtml = await fetchPage(baseUrl + oneYearUrl);
+      const oneYearMarkdown = oneYearHtml
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/\s{2,}/g, ' ')
+        .replace(/ \n/g, '\n');
       const oneYearUpcoming = parseUpcomingTable(oneYearMarkdown, '1-year');
       results.upcoming.push(...oneYearUpcoming);
 
@@ -172,6 +186,11 @@ export async function GET(request) {
     return Response.json({
       success: true,
       source: 'ilovessb.com',
+      debug: {
+        sixMonthTextPreview: sixMonthMarkdown.slice(0, 500),
+        hasUpcomingSection: sixMonthMarkdown.includes('Upcoming Auctions'),
+        sixMonthUpcomingCount: sixMonthUpcoming.length,
+      },
       closed: { found: results.closed.length, saved: savedAuctions, data: results.closed },
       upcoming: { found: results.upcoming.length, saved: savedUpcoming, data: results.upcoming.slice(0, 3) },
     });
